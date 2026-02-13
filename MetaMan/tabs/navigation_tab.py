@@ -181,6 +181,7 @@ class NavigationTab(QWidget):
         self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.tree.itemSelectionChanged.connect(self._on_select)
         self.tree.itemExpanded.connect(self._on_item_expanded)
+        self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         left_layout.addWidget(self.tree, 1)
 
         btns = QHBoxLayout()
@@ -621,6 +622,17 @@ class NavigationTab(QWidget):
         kind, path, _ = sel
         if kind != "session":
             QMessageBox.warning(self, "Select session", "Please select a session node.")
+            return
+        self.on_load_session(path)
+
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, _column: int):
+        if item is None:
+            return
+        data = item.data(0, Qt.UserRole)
+        if not data:
+            return
+        kind, path = data
+        if kind != "session":
             return
         self.on_load_session(path)
 
