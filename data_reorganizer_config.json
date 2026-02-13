@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "project_mode": "Use existing project",
+  "existing_project": "LgDel_project",
+  "new_project_name": "",
+  "experiment_name": "social_habituation_dishabituation_NAc_dlight",
+  "source_raw_dir": "C:\\Analysis\\fiberPhotometry\\rawData\\19-03-2025-corridor-dlight-lgdel",
+  "source_processed_dir": "C:/Analysis/fiberPhotometry/preprocessedData/19-03-2025-corridor-dlight-lgdel",
+  "target_raw_root": "S:\\BelloneLab\\#SHARE\\AndryA\\PROJECTS\\raw",
+  "target_processed_root": "S:\\BelloneLab\\#SHARE\\AndryA\\PROJECTS\\processed",
+  "plan_path": "C:/Analysis/fiberPhotometry/plans/19-03-2025-corridor-dlight-lgdel/19-03-2025-corridor-dlight-lgdel_plan.xlsx",
+  "preserve_group_hierarchy": false,
+  "overwrite_strategy": "overwrite",
+  "overwrite_confirm": true,
+  "dry_run": false,
+  "verify_size": false,
+  "column_assignment": {
+    "subject_col": "ID",
+    "session_col": "",
+    "trial_col": "trial",
+    "genotype_col": "genotype",
+    "condition_col": "exp",
+    "match_mode": "Use only trial_id for matching",
+    "case_sensitive": false,
+    "extra_cols": [
+      "trial",
+      "ID",
+      "genotype",
+      "stim",
+      "stimID",
+      "trial.1",
+      "exp",
+      "nb",
+      "comments"
+    ],
+    "custom_match_cols": []
+  },
+  "datatype_map": {
+    "fiber_photometry": "fiber_photometry",
+    "labels": "labels",
+    "pyBered": "pyBered",
+    "videos": "videos"
+  }
+}
