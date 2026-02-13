@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -111,12 +112,18 @@ class RecordingTab(QWidget):
         row3 = QHBoxLayout()
         row3.addWidget(QLabel("Subject"))
         self.cb_sub = QComboBox()
-        self.cb_sub.setEditable(False)
+        self.cb_sub.setEditable(True)
         row3.addWidget(self.cb_sub, 1)
+        b_new_sub = QPushButton("New subject")
+        b_new_sub.clicked.connect(self._prompt_new_subject)
+        row3.addWidget(b_new_sub)
         row3.addWidget(QLabel("Session"))
         self.cb_sess = QComboBox()
-        self.cb_sess.setEditable(False)
+        self.cb_sess.setEditable(True)
         row3.addWidget(self.cb_sess, 1)
+        b_new_sess = QPushButton("New session")
+        b_new_sess.clicked.connect(self._prompt_new_session)
+        row3.addWidget(b_new_sess)
         left_vbox.addLayout(row3)
 
         for cb in (self.cb_proj, self.cb_exp, self.cb_sub, self.cb_sess):
@@ -130,6 +137,8 @@ class RecordingTab(QWidget):
         self.cb_sub.currentIndexChanged.connect(lambda _i: self._persist_settings())
         self.cb_sess.currentIndexChanged.connect(self._on_session_changed)
         self.cb_sess.currentIndexChanged.connect(lambda _i: self._persist_settings())
+        self.cb_sub.currentTextChanged.connect(lambda _t: self._persist_settings())
+        self.cb_sess.currentTextChanged.connect(lambda _t: self._persist_settings())
         self.ed_root.textChanged.connect(self._persist_settings)
 
         self.tbl_meta = QTableWidget(0, 2)
@@ -327,6 +336,53 @@ class RecordingTab(QWidget):
                 cb.setEditText("")
         cb.blockSignals(False)
 
+    def _sanitize_entry_name(self, value: str) -> str:
+        bad = '<>:"/\\|?*'
+        cleaned = "".join(ch for ch in str(value or "").strip() if ch not in bad)
+        return cleaned.strip()
+
+    def _ensure_combo_has_value(self, cb: QComboBox, value: str):
+        text = self._sanitize_entry_name(value)
+        if not text:
+            return
+        for i in range(cb.count()):
+            if cb.itemText(i).strip().lower() == text.lower():
+                cb.setCurrentIndex(i)
+                return
+        cb.addItem(text)
+        cb.setCurrentText(text)
+
+    def _prompt_new_subject(self):
+        project = self._current_project()
+        experiment = self._current_experiment()
+        if not project or not experiment:
+            QMessageBox.warning(self, "New subject", "Select project and experiment first.")
+            return
+        text, ok = QInputDialog.getText(self, "New subject", "Subject ID:")
+        if not ok:
+            return
+        subject = self._sanitize_entry_name(text)
+        if not subject:
+            QMessageBox.warning(self, "New subject", "Subject ID cannot be empty.")
+            return
+        self._ensure_combo_has_value(self.cb_sub, subject)
+        self._on_subject_changed()
+        self._persist_settings()
+
+    def _prompt_new_session(self):
+        if not self._current_subject():
+            QMessageBox.warning(self, "New session", "Select or create a subject first.")
+            return
+        text, ok = QInputDialog.getText(self, "New session", "Session ID:")
+        if not ok:
+            return
+        session = self._sanitize_entry_name(text)
+        if not session:
+            QMessageBox.warning(self, "New session", "Session ID cannot be empty.")
+            return
+        self._ensure_combo_has_value(self.cb_sess, session)
+        self._persist_settings()
+
     def _refresh_lists(self):
         normalized = self._effective_data_root()
         if normalized:
@@ -457,13 +513,36 @@ class RecordingTab(QWidget):
         for d in (project_dir, experiment_dir, subject_dir, session_dir):
             os.makedirs(d, exist_ok=True)
 
-        meta = SessionMetadata.new(project, subject, session, self._raw_root()).data
-        meta["Experiment"] = experiment
-        meta["Subject"] = subject
+        meta = self._new_recording_metadata(project, experiment, subject, session)
         self.meta = meta
         save_session_triplet(session_dir, self.meta, logger=self.logger.log)
         self.load_session(session_dir)
         self._persist_settings()
+
+    def _new_recording_metadata(self, project: str, experiment: str, subject: str, session: str) -> Dict[str, Any]:
+        # Keep schema keys, but start non-identifying fields empty for new recordings.
+        meta = SessionMetadata.new(project, subject, session, self._raw_root()).data
+        keep_keys = {"Project", "Experiment", "Animal", "Subject", "Session", "file_list", "trial_info", "trial_assets", "preprocessing"}
+        for k in list(meta.keys()):
+            if k in keep_keys:
+                continue
+            v = meta.get(k)
+            if isinstance(v, list):
+                meta[k] = []
+            elif isinstance(v, dict):
+                meta[k] = {}
+            else:
+                meta[k] = ""
+        meta["Project"] = project
+        meta["Experiment"] = experiment
+        meta["Animal"] = subject
+        meta["Subject"] = subject
+        meta["Session"] = str(session)
+        meta["file_list"] = []
+        meta["trial_info"] = {}
+        meta["trial_assets"] = {}
+        meta["preprocessing"] = []
+        return meta
 
     def update_file_list(self):
         session_dir = self._session_dir()
