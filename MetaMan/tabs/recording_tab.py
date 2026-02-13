@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime
 from typing import Any, Dict, List
 
 from PySide6.QtCore import Qt
@@ -522,7 +523,20 @@ class RecordingTab(QWidget):
     def _new_recording_metadata(self, project: str, experiment: str, subject: str, session: str) -> Dict[str, Any]:
         # Keep schema keys, but start non-identifying fields empty for new recordings.
         meta = SessionMetadata.new(project, subject, session, self._raw_root()).data
-        keep_keys = {"Project", "Experiment", "Animal", "Subject", "Session", "file_list", "trial_info", "trial_assets", "preprocessing"}
+        keep_keys = {
+            "DateTime",
+            "Project",
+            "Experiment",
+            "Animal",
+            "Subject",
+            "Session",
+            "RootDir",
+            "SessionUUID",
+            "file_list",
+            "trial_info",
+            "trial_assets",
+            "preprocessing",
+        }
         for k in list(meta.keys()):
             if k in keep_keys:
                 continue
@@ -538,6 +552,7 @@ class RecordingTab(QWidget):
         meta["Animal"] = subject
         meta["Subject"] = subject
         meta["Session"] = str(session)
+        meta["DateTime"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         meta["file_list"] = []
         meta["trial_info"] = {}
         meta["trial_assets"] = {}
