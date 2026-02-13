@@ -1,5 +1,7 @@
 import json
 import os
+import subprocess
+import sys
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt
@@ -120,6 +122,9 @@ class PreprocessingTab(QWidget):
         self.ed_proc_root.textChanged.connect(self._persist_settings)
         self.ed_proc_root.textEdited.connect(self._on_proc_root_text_edited)
         row.addWidget(self.ed_proc_root, 1)
+        b_browse_proc = QPushButton("Browse...")
+        b_browse_proc.clicked.connect(self._choose_processed_root)
+        row.addWidget(b_browse_proc)
         b_create = QPushButton("Create folder")
         b_create.clicked.connect(self._create_processed_folder)
         row.addWidget(b_create)
@@ -168,6 +173,8 @@ class PreprocessingTab(QWidget):
         rowR.addWidget(self.ed_results_dir, 1)
         b_browse_results = QPushButton("Choose..."); b_browse_results.clicked.connect(self._select_results_dir)
         rowR.addWidget(b_browse_results)
+        b_open_results = QPushButton("Open folder"); b_open_results.clicked.connect(self._open_step_folder)
+        rowR.addWidget(b_open_results)
         b_apply_results = QPushButton("Save results folder"); b_apply_results.clicked.connect(self._apply_results_dir)
         rowR.addWidget(b_apply_results)
         c.addLayout(rowR)
@@ -206,6 +213,15 @@ class PreprocessingTab(QWidget):
         self._proc_root_user_edited = False
         self._update_default_processed_root(force=True)
         self._refresh_lists()
+        self._persist_settings()
+
+    def _choose_processed_root(self):
+        start = self.ed_proc_root.text().strip() or self._default_processed_session_dir()
+        d = QFileDialog.getExistingDirectory(self, "Choose processed folder", start)
+        if not d:
+            return
+        self._proc_root_user_edited = True
+        self.ed_proc_root.setText(d)
         self._persist_settings()
 
     def _normalize_data_root(self, path: str) -> str:
@@ -295,6 +311,7 @@ class PreprocessingTab(QWidget):
         keep_proj = self.cb_proj.currentText().strip()
         self._set_combo_items(self.cb_proj, list_projects(self._raw_root()), keep_proj)
         self._on_project_changed()
+        self._update_default_processed_root()
 
     def _on_project_changed(self, _index: int = -1):
         proj = self.cb_proj.currentText().strip()
@@ -302,6 +319,7 @@ class PreprocessingTab(QWidget):
         items = list_experiments(os.path.join(self._raw_root(), proj)) if proj else []
         self._set_combo_items(self.cb_exp, items, keep_exp)
         self._on_experiment_changed()
+        self._update_default_processed_root()
 
     def _on_experiment_changed(self, _index: int = -1):
         proj = self.cb_proj.currentText().strip()
@@ -321,6 +339,8 @@ class PreprocessingTab(QWidget):
         self._set_combo_items(self.cb_sess, items, keep_sess)
         self._update_default_processed_root()
         self._persist_settings()
+        if not self._loading_session:
+            self._try_load_current_session(show_warning=False)
 
     def _on_session_changed(self, _index: int):
         if self._loading_session:
@@ -453,7 +473,21 @@ class PreprocessingTab(QWidget):
         self.cb_step.blockSignals(False)
 
     def _load_from_session(self, session_dir: str):
-        self.meta = load_session_metadata(session_dir) or {}
+        loaded = load_session_metadata(session_dir) or {}
+        if not loaded:
+            sub_dir = os.path.dirname(session_dir)
+            exp_dir = os.path.dirname(sub_dir)
+            project_dir = os.path.dirname(exp_dir)
+            subject = os.path.basename(sub_dir)
+            loaded = {
+                "Project": os.path.basename(project_dir),
+                "Experiment": os.path.basename(exp_dir),
+                "Subject": subject,
+                "Animal": subject,
+                "Session": os.path.basename(session_dir),
+                "preprocessing": [],
+            }
+        self.meta = loaded
         self._loading_session = True
         try:
             if self.meta:
@@ -514,10 +548,10 @@ class PreprocessingTab(QWidget):
 
     def _create_processed_folder(self):
         """Create processed folder structure and copy current metadata triplet."""
-        exp = self.meta.get("Experiment", "")
-        subject = self.meta.get("Subject", "") or self.meta.get("Animal", "")
-        session = self.meta.get("Session", "")
-        root = self.ed_proc_root.text().strip()
+        exp = self.cb_exp.currentText().strip() or str(self.meta.get("Experiment", "")).strip()
+        subject = self.cb_sub.currentText().strip() or str(self.meta.get("Subject", "") or self.meta.get("Animal", "")).strip()
+        session = self.cb_sess.currentText().strip() or str(self.meta.get("Session", "")).strip()
+        root = self.ed_proc_root.text().strip() or self._default_processed_session_dir()
         if not (exp and subject and session and root):
             QMessageBox.warning(self, "Missing", "Missing processed root or session info.")
             return
@@ -617,7 +651,10 @@ class PreprocessingTab(QWidget):
         # Update center widgets from selected step
         self.txt_params.setText(json.dumps(cur.get("params", {}), indent=2))
         self.txt_comments.setText(cur.get("comments", ""))
-        self.ed_results_dir.setText(cur.get("results_dir", ""))
+        results_dir = str(cur.get("results_dir", "")).strip()
+        if not results_dir:
+            results_dir = self._default_step_results_dir(cur.get("name", "step"))
+        self.ed_results_dir.setText(results_dir)
 
     # ------------------------ Params & comments ------------------------
 
@@ -732,6 +769,33 @@ class PreprocessingTab(QWidget):
             return
         self.ed_results_dir.setText(d)
 
+    def _default_step_results_dir(self, step_name: str) -> str:
+        base = self.ed_proc_root.text().strip() or self._default_processed_session_dir()
+        name = self._sanitize_step_name(step_name).replace(" ", "_")
+        return os.path.join(base, name) if name else base
+
+    def _open_step_folder(self):
+        cur = self._current_step()
+        if not cur:
+            QMessageBox.warning(self, "Step", "Select a preprocessing step first.")
+            return
+        path = self.ed_results_dir.text().strip() or str(cur.get("results_dir", "")).strip()
+        if not path:
+            path = self._default_step_results_dir(str(cur.get("name", "step")))
+            self.ed_results_dir.setText(path)
+            cur["results_dir"] = path
+            self._save_current_session_meta()
+        os.makedirs(path, exist_ok=True)
+        try:
+            if os.name == "nt":
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.run(["open", path], check=False)
+            else:
+                subprocess.run(["xdg-open", path], check=False)
+        except Exception as e:
+            QMessageBox.critical(self, "Open folder", f"Failed to open folder:\n{path}\n\n{e}")
+
     def _apply_results_dir(self):
         cur = self._current_step()
         if not cur:
@@ -744,13 +808,7 @@ class PreprocessingTab(QWidget):
         dr = self._normalize_data_root(self.app_state.settings.data_root)
         if dr:
             self.ed_data_root.setText(dr)
-        pr = str(data.get("processed_root", "")).strip()
-        if pr:
-            self._proc_root_user_edited = True
-            self.ed_proc_root.setText(pr)
-        else:
-            self._proc_root_user_edited = False
-            self._update_default_processed_root(force=True)
+        self._proc_root_user_edited = False
         for cb, k in (
             (self.cb_proj, "project"),
             (self.cb_exp, "experiment"),
@@ -760,6 +818,7 @@ class PreprocessingTab(QWidget):
             v = str(data.get(k, "")).strip()
             if v:
                 cb.setCurrentText(v)
+        self._update_default_processed_root(force=True)
 
     def _persist_settings(self):
         root = self._normalize_data_root(self.app_state.settings.data_root)
