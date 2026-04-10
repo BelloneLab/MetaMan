@@ -1,5 +1,7 @@
 import json
 import os
+import subprocess
+import sys
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt
@@ -11,23 +13,23 @@ from PySide6.QtWidgets import (
 
 from ..state import AppState
 from ..io_ops import (
+    list_experiments,
     list_projects,
+    list_sessions,
+    list_subjects,
     save_session_triplet,
     load_session_metadata,
 )
-from ..services.structure_schema import (
-    build_role_path,
-    extract_values_from_path,
-    list_role_values,
-    load_project_schema,
-    role_enabled,
-    role_label,
-)
 
-# Step menus (kept as requested)
-NPX_STEPS = ["spike_sorting", "curation", "histology", "time_sync", "dlc", "add_new_step"]
-FIBER_STEPS = ["artefact_removal", "delta_F/F", "time_sync", "dlc", "add_new_step"]
-BEHAV_STEPS = ["manual_scoring", "DLC", "lisbet", "dlc", "add_new_step"]
+# Default step templates
+NPX_STEPS = ["spike_sorting", "curation", "time_sync", "histology", "dlc"]
+FIBER_STEPS = ["dff_zscore", "behavior_scoring"]
+BEHAV_STEPS = ["behavior_scoring", "dlc"]
+CUSTOM_STEP_LABEL = "Add custom step..."
+
+STEP_STATUS_PLANNED = "planned"
+STEP_STATUS_ONGOING = "ongoing"
+STEP_STATUS_COMPLETED = "completed"
 
 
 def dict_to_table(tbl: QTableWidget, data: Dict[str, Any]):
@@ -50,7 +52,7 @@ class PreprocessingTab(QWidget):
       CENTER : Parameters/Comments + Import params + Results folder
       RIGHT  : Session Info (read-only key/value table)
 
-    - 'add_new_step' lets the user name a custom step.
+    - 'Add custom step...' lets the user name a custom step.
     - 'Import params (CSV/JSON)' loads that file into the selected step's params.
     - 'Results folder' lets you store a path per step as 'results_dir'.
     """
@@ -60,7 +62,7 @@ class PreprocessingTab(QWidget):
         self.app_state = app_state
         self.meta: Dict[str, Any] = {}
         self._loading_session = False
-        self._active_schema = self._default_schema()
+        self._proc_root_user_edited = False
         self._build_ui()
         self._load_settings()
         self._refresh_lists()
@@ -90,17 +92,13 @@ class PreprocessingTab(QWidget):
         root.addLayout(row_sel0)
 
         row_sel1 = QHBoxLayout()
-        self.lbl_project = QLabel("Project")
-        row_sel1.addWidget(self.lbl_project)
+        row_sel1.addWidget(QLabel("Project"))
         self.cb_proj = QComboBox(); self.cb_proj.setEditable(False); row_sel1.addWidget(self.cb_proj, 1)
-        self.lbl_experiment = QLabel("Experiment")
-        row_sel1.addWidget(self.lbl_experiment)
+        row_sel1.addWidget(QLabel("Experiment"))
         self.cb_exp = QComboBox(); self.cb_exp.setEditable(False); row_sel1.addWidget(self.cb_exp, 1)
-        self.lbl_subject = QLabel("Subject")
-        row_sel1.addWidget(self.lbl_subject)
+        row_sel1.addWidget(QLabel("Subject"))
         self.cb_sub = QComboBox(); self.cb_sub.setEditable(False); row_sel1.addWidget(self.cb_sub, 1)
-        self.lbl_session = QLabel("Session")
-        row_sel1.addWidget(self.lbl_session)
+        row_sel1.addWidget(QLabel("Session"))
         self.cb_sess = QComboBox(); self.cb_sess.setEditable(False); row_sel1.addWidget(self.cb_sess, 1)
         root.addLayout(row_sel1)
 
@@ -122,7 +120,11 @@ class PreprocessingTab(QWidget):
         row.addWidget(QLabel("Processed root:"))
         self.ed_proc_root = QLineEdit(self.app_state.settings.processed_root)
         self.ed_proc_root.textChanged.connect(self._persist_settings)
+        self.ed_proc_root.textEdited.connect(self._on_proc_root_text_edited)
         row.addWidget(self.ed_proc_root, 1)
+        b_browse_proc = QPushButton("Browse...")
+        b_browse_proc.clicked.connect(self._choose_processed_root)
+        row.addWidget(b_browse_proc)
         b_create = QPushButton("Create folder")
         b_create.clicked.connect(self._create_processed_folder)
         row.addWidget(b_create)
@@ -140,8 +142,10 @@ class PreprocessingTab(QWidget):
         l.addWidget(QLabel("Steps"))
         self.steps = QListWidget(); l.addWidget(self.steps, 1)
         rowL = QHBoxLayout()
-        self.cb_step = QComboBox(); self.cb_step.addItems(BEHAV_STEPS); rowL.addWidget(self.cb_step)
+        self.cb_step = QComboBox(); rowL.addWidget(self.cb_step)
         b_add = QPushButton("Add step"); b_add.clicked.connect(self._add_step); rowL.addWidget(b_add)
+        b_plan = QPushButton("Planned"); b_plan.clicked.connect(self._mark_planned); rowL.addWidget(b_plan)
+        b_ongoing = QPushButton("Ongoing"); b_ongoing.clicked.connect(self._mark_ongoing); rowL.addWidget(b_ongoing)
         b_done = QPushButton("Completed"); b_done.clicked.connect(self._mark_completed); rowL.addWidget(b_done)
         b_remove = QPushButton("Remove step"); b_remove.clicked.connect(self._remove_step); rowL.addWidget(b_remove)
         l.addLayout(rowL)
@@ -167,8 +171,10 @@ class PreprocessingTab(QWidget):
         rowR = QHBoxLayout()
         self.ed_results_dir = QLineEdit()
         rowR.addWidget(self.ed_results_dir, 1)
-        b_browse_results = QPushButton("Choose…"); b_browse_results.clicked.connect(self._select_results_dir)
+        b_browse_results = QPushButton("Choose..."); b_browse_results.clicked.connect(self._select_results_dir)
         rowR.addWidget(b_browse_results)
+        b_open_results = QPushButton("Open folder"); b_open_results.clicked.connect(self._open_step_folder)
+        rowR.addWidget(b_open_results)
         b_apply_results = QPushButton("Save results folder"); b_apply_results.clicked.connect(self._apply_results_dir)
         rowR.addWidget(b_apply_results)
         c.addLayout(rowR)
@@ -195,35 +201,7 @@ class PreprocessingTab(QWidget):
 
         # Hook step selection
         self.steps.currentRowChanged.connect(self._update_param_comment)
-
-    def _default_schema(self):
-        try:
-            return self.app_state.settings.get_default_structure_schema()
-        except Exception:
-            return {}
-
-    def _project_schema(self, project_name: str):
-        return load_project_schema(
-            self._raw_root(),
-            project_name,
-            fallback=self._default_schema(),
-        )
-
-    def _current_schema(self):
-        proj = self.cb_proj.currentText().strip()
-        if proj:
-            self._active_schema = self._project_schema(proj)
-        return self._active_schema
-
-    def _update_role_labels(self):
-        schema = self._current_schema()
-        self.lbl_project.setText(role_label(schema, "project", kind="raw"))
-        self.lbl_experiment.setText(role_label(schema, "experiment", kind="raw"))
-        self.lbl_subject.setText(role_label(schema, "subject", kind="raw"))
-        self.lbl_session.setText(role_label(schema, "session", kind="raw"))
-        self.cb_exp.setEnabled(role_enabled(schema, "experiment", kind="raw"))
-        self.cb_sub.setEnabled(role_enabled(schema, "subject", kind="raw"))
-        self.cb_sess.setEnabled(role_enabled(schema, "session", kind="raw"))
+        self._refresh_step_choices()
 
     def _choose_data_root(self):
         d = QFileDialog.getExistingDirectory(self, "Choose data root", self.ed_data_root.text() or "")
@@ -232,8 +210,18 @@ class PreprocessingTab(QWidget):
         normalized = self._normalize_data_root(d)
         self.ed_data_root.setText(normalized)
         self.app_state.settings.data_root = normalized
-        self.ed_proc_root.setText(self.app_state.settings.processed_root)
+        self._proc_root_user_edited = False
+        self._update_default_processed_root(force=True)
         self._refresh_lists()
+        self._persist_settings()
+
+    def _choose_processed_root(self):
+        start = self.ed_proc_root.text().strip() or self._default_processed_session_dir()
+        d = QFileDialog.getExistingDirectory(self, "Choose processed folder", start)
+        if not d:
+            return
+        self._proc_root_user_edited = True
+        self.ed_proc_root.setText(d)
         self._persist_settings()
 
     def _normalize_data_root(self, path: str) -> str:
@@ -291,6 +279,27 @@ class PreprocessingTab(QWidget):
                 cb.setEditText("")
         cb.blockSignals(False)
 
+    def _on_proc_root_text_edited(self, _txt: str):
+        self._proc_root_user_edited = True
+
+    def _default_processed_session_dir(self) -> str:
+        data_root = self._effective_data_root()
+        exp = self.cb_exp.currentText().strip() or str(self.meta.get("Experiment", "")).strip()
+        sub = self.cb_sub.currentText().strip() or str(self.meta.get("Subject", "") or self.meta.get("Animal", "")).strip()
+        sess = self.cb_sess.currentText().strip() or str(self.meta.get("Session", "")).strip()
+        base = os.path.join(data_root, "processed")
+        if exp and sub and sess:
+            return os.path.join(base, exp, sub, sess)
+        return base
+
+    def _update_default_processed_root(self, force: bool = False):
+        if self._proc_root_user_edited and not force:
+            return
+        target = self._default_processed_session_dir()
+        self.ed_proc_root.blockSignals(True)
+        self.ed_proc_root.setText(target)
+        self.ed_proc_root.blockSignals(False)
+
     def _refresh_lists(self):
         normalized = self._effective_data_root()
         if normalized:
@@ -302,95 +311,51 @@ class PreprocessingTab(QWidget):
         keep_proj = self.cb_proj.currentText().strip()
         self._set_combo_items(self.cb_proj, list_projects(self._raw_root()), keep_proj)
         self._on_project_changed()
+        self._update_default_processed_root()
 
     def _on_project_changed(self, _index: int = -1):
         proj = self.cb_proj.currentText().strip()
-        self._active_schema = self._project_schema(proj) if proj else self._default_schema()
-        self._update_role_labels()
         keep_exp = self.cb_exp.currentText().strip()
-        schema = self._current_schema()
-        items = (
-            list_role_values(
-                self._raw_root(),
-                schema,
-                role="experiment",
-                filters={"project": proj},
-                kind="raw",
-            )
-            if proj
-            else []
-        )
+        items = list_experiments(os.path.join(self._raw_root(), proj)) if proj else []
         self._set_combo_items(self.cb_exp, items, keep_exp)
         self._on_experiment_changed()
+        self._update_default_processed_root()
 
     def _on_experiment_changed(self, _index: int = -1):
         proj = self.cb_proj.currentText().strip()
         exp = self.cb_exp.currentText().strip()
         keep_sub = self.cb_sub.currentText().strip()
-        schema = self._current_schema()
-        items = (
-            list_role_values(
-                self._raw_root(),
-                schema,
-                role="subject",
-                filters={"project": proj, "experiment": exp},
-                kind="raw",
-            )
-            if proj and exp
-            else []
-        )
+        items = list_subjects(os.path.join(self._raw_root(), proj, exp)) if (proj and exp) else []
         self._set_combo_items(self.cb_sub, items, keep_sub)
         self._on_subject_changed()
+        self._update_default_processed_root()
 
     def _on_subject_changed(self, _index: int = -1):
         proj = self.cb_proj.currentText().strip()
         exp = self.cb_exp.currentText().strip()
         sub = self.cb_sub.currentText().strip()
         keep_sess = self.cb_sess.currentText().strip()
-        schema = self._current_schema()
-        items = (
-            list_role_values(
-                self._raw_root(),
-                schema,
-                role="session",
-                filters={"project": proj, "experiment": exp, "subject": sub},
-                kind="raw",
-            )
-            if proj and exp and sub
-            else []
-        )
+        items = list_sessions(os.path.join(self._raw_root(), proj, exp, sub)) if (proj and exp and sub) else []
         self._set_combo_items(self.cb_sess, items, keep_sess)
+        self._update_default_processed_root()
         self._persist_settings()
+        if not self._loading_session:
+            self._try_load_current_session(show_warning=False)
 
     def _on_session_changed(self, _index: int):
         if self._loading_session:
             return
+        self._update_default_processed_root()
         self._persist_settings()
         self._try_load_current_session(show_warning=False)
 
     def _selected_session_dir(self) -> str:
-        schema = self._current_schema()
-        values = {
-            "project": self.cb_proj.currentText().strip(),
-            "experiment": self.cb_exp.currentText().strip(),
-            "subject": self.cb_sub.currentText().strip(),
-            "session": self.cb_sess.currentText().strip(),
-        }
-        path = build_role_path(
-            self._raw_root(),
-            schema,
-            values,
-            role="session",
-            kind="raw",
-        )
-        if path:
-            return path
         return os.path.join(
             self._raw_root(),
-            values.get("project", ""),
-            values.get("experiment", ""),
-            values.get("subject", ""),
-            values.get("session", ""),
+            self.cb_proj.currentText().strip(),
+            self.cb_exp.currentText().strip(),
+            self.cb_sub.currentText().strip(),
+            self.cb_sess.currentText().strip(),
         )
 
     def _try_load_current_session(self, show_warning: bool):
@@ -414,28 +379,115 @@ class PreprocessingTab(QWidget):
     # ------------------------ Session load / step menu ------------------------
 
     def _determine_step_choices(self) -> List[str]:
-        rec = (self.meta.get("Recording") or "").lower()
-        if "npx" in rec or "neuro" in rec:
+        rec = str(self.meta.get("Recording") or "")
+        exp = str(self.meta.get("Experiment") or "")
+        hint = f"{rec} {exp} {self.cb_exp.currentText()}".lower()
+        if "npx" in hint or "neuro" in hint or "neuropixel" in hint:
             return NPX_STEPS
-        if "fiber" in rec:
+        if "fiber" in hint or "photometry" in hint:
             return FIBER_STEPS
         return BEHAV_STEPS
 
+    def _sanitize_step_name(self, name: str) -> str:
+        return str(name or "").strip().replace("\n", " ").replace("\r", " ")
+
+    def _normalize_step_status(self, status: str) -> str:
+        s = str(status or "").strip().lower()
+        if s in ("in_progress", "inprogress", "ongoing"):
+            return STEP_STATUS_ONGOING
+        if s in ("completed", "done"):
+            return STEP_STATUS_COMPLETED
+        return STEP_STATUS_PLANNED
+
+    def _session_path_for_save(self) -> str:
+        p = self.app_state.current_session_path
+        if p and os.path.isdir(p):
+            return p
+        return self._selected_session_dir()
+
+    def _save_current_session_meta(self):
+        session_dir = self._session_path_for_save()
+        if not session_dir:
+            return
+        os.makedirs(session_dir, exist_ok=True)
+        save_session_triplet(session_dir, self.meta)
+
+    def _normalize_preprocessing_steps(self):
+        raw_steps = self.meta.get("preprocessing", [])
+        if not isinstance(raw_steps, list):
+            raw_steps = []
+        normalized = []
+        seen = set()
+        for step in raw_steps:
+            if not isinstance(step, dict):
+                continue
+            name = self._sanitize_step_name(step.get("name", ""))
+            if not name:
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(
+                {
+                    "name": name,
+                    "params": step.get("params", {}) if isinstance(step.get("params", {}), dict) else {},
+                    "comments": str(step.get("comments", "") or ""),
+                    "status": self._normalize_step_status(str(step.get("status", ""))),
+                    "results_dir": str(step.get("results_dir", "") or ""),
+                }
+            )
+        self.meta["preprocessing"] = normalized
+
+    def _ensure_default_steps_present(self):
+        defaults = self._determine_step_choices()
+        steps = self.meta.setdefault("preprocessing", [])
+        existing = {str(s.get("name", "")).strip().lower() for s in steps if isinstance(s, dict)}
+        added = False
+        for name in defaults:
+            key = name.strip().lower()
+            if not key or key in existing:
+                continue
+            steps.append(
+                {
+                    "name": name,
+                    "params": {},
+                    "comments": "",
+                    "status": STEP_STATUS_PLANNED,
+                    "results_dir": "",
+                }
+            )
+            existing.add(key)
+            added = True
+        if added:
+            self._save_current_session_meta()
+
+    def _refresh_step_choices(self):
+        choices = self._determine_step_choices() + [CUSTOM_STEP_LABEL]
+        keep = self.cb_step.currentText().strip()
+        self.cb_step.blockSignals(True)
+        self.cb_step.clear()
+        self.cb_step.addItems(choices)
+        if keep and keep in choices:
+            self.cb_step.setCurrentText(keep)
+        self.cb_step.blockSignals(False)
+
     def _load_from_session(self, session_dir: str):
-        self.meta = load_session_metadata(session_dir) or {}
-        if not self.meta:
-            root = self._raw_root()
-            rel_parts = [p for p in os.path.relpath(session_dir, root).split(os.sep) if p and p != "."]
-            project = rel_parts[0] if rel_parts else ""
-            schema = self._project_schema(project) if project else self._default_schema()
-            vals = extract_values_from_path(root, schema, session_dir, kind="raw")
-            self.meta = {
-                "Project": vals.get("project", ""),
-                "Experiment": vals.get("experiment", ""),
-                "Subject": vals.get("subject", ""),
-                "Session": vals.get("session", ""),
+        loaded = load_session_metadata(session_dir) or {}
+        if not loaded:
+            sub_dir = os.path.dirname(session_dir)
+            exp_dir = os.path.dirname(sub_dir)
+            project_dir = os.path.dirname(exp_dir)
+            subject = os.path.basename(sub_dir)
+            loaded = {
+                "Project": os.path.basename(project_dir),
+                "Experiment": os.path.basename(exp_dir),
+                "Subject": subject,
+                "Animal": subject,
+                "Session": os.path.basename(session_dir),
                 "preprocessing": [],
             }
+        self.meta = loaded
         self._loading_session = True
         try:
             if self.meta:
@@ -457,19 +509,27 @@ class PreprocessingTab(QWidget):
                 self.app_state.set_current(project=proj, experiment=exp, animal=sub, session=sess, session_path=session_dir)
         finally:
             self._loading_session = False
+        self._normalize_preprocessing_steps()
+        self._ensure_default_steps_present()
         self._refresh_steps()
-        # update choices
-        self.cb_step.clear()
-        self.cb_step.addItems(self._determine_step_choices())
+        self._refresh_step_choices()
         # refresh session info panel
         dict_to_table(self.tbl_session_info, self.meta)
+        self._update_default_processed_root()
         self._persist_settings()
 
     def _refresh_steps(self):
         self.steps.clear()
-        for s in self.meta.get("preprocessing", []):
-            name = s.get("name", "")
-            status = s.get("status", "")
+        steps = self.meta.get("preprocessing", [])
+        if not isinstance(steps, list):
+            return
+        for s in steps:
+            if not isinstance(s, dict):
+                continue
+            name = str(s.get("name", "")).strip()
+            if not name:
+                continue
+            status = self._normalize_step_status(str(s.get("status", "")))
             self.steps.addItem(f"{name} [{status}]")
 
     def _current_step(self) -> Optional[Dict[str, Any]]:
@@ -488,34 +548,22 @@ class PreprocessingTab(QWidget):
 
     def _create_processed_folder(self):
         """Create processed folder structure and copy current metadata triplet."""
-        proj = self.meta.get("Project", "")
-        exp = self.meta.get("Experiment", "")
-        subject = self.meta.get("Subject", "") or self.meta.get("Animal", "")
-        session = self.meta.get("Session", "")
-        root = self.ed_proc_root.text().strip()
-        if not (proj and exp and subject and session and root):
+        exp = self.cb_exp.currentText().strip() or str(self.meta.get("Experiment", "")).strip()
+        subject = self.cb_sub.currentText().strip() or str(self.meta.get("Subject", "") or self.meta.get("Animal", "")).strip()
+        session = self.cb_sess.currentText().strip() or str(self.meta.get("Session", "")).strip()
+        root = self.ed_proc_root.text().strip() or self._default_processed_session_dir()
+        if not (exp and subject and session and root):
             QMessageBox.warning(self, "Missing", "Missing processed root or session info.")
             return
-
-        schema = self._project_schema(str(proj))
-        values = {
-            "project": str(proj),
-            "experiment": str(exp),
-            "subject": str(subject),
-            "session": str(session),
-        }
-        session_proc = build_role_path(
-            root,
-            schema,
-            values,
-            role="session",
-            kind="processed",
-        )
-        if not session_proc:
-            session_proc = os.path.join(root, str(proj), str(exp), str(subject), str(session))
+        suffix = os.path.normcase(os.path.normpath(os.path.join(exp, subject, session)))
+        root_norm = os.path.normcase(os.path.normpath(root))
+        if root_norm.endswith(suffix):
+            session_proc = root
+        else:
+            session_proc = os.path.join(root, exp, subject, session)
         os.makedirs(session_proc, exist_ok=True)
         save_session_triplet(session_proc, self.meta)
-        self.app_state.settings.processed_root = root
+        self.app_state.settings.processed_root = os.path.join(self._effective_data_root(), "processed")
         QMessageBox.information(self, "Created", f"Processed session created:\n{session_proc}")
 
     # ------------------------ Step actions ------------------------
@@ -524,26 +572,40 @@ class PreprocessingTab(QWidget):
         choice = self.cb_step.currentText().strip()
         if not choice:
             return
-        if choice == "add_new_step":
+        if choice == CUSTOM_STEP_LABEL:
             name, ok = QInputDialog.getText(self, "New step", "Step name:")
             if not ok or not name.strip():
                 return
-            step_name = name.strip()
+            step_name = self._sanitize_step_name(name)
         else:
-            step_name = choice
+            step_name = self._sanitize_step_name(choice)
+
+        if not step_name:
+            QMessageBox.warning(self, "Step", "Step name cannot be empty.")
+            return
 
         # Avoid duplicates with same name
-        for s in self.meta.get("preprocessing", []):
-            if s.get("name") == step_name:
+        existing_steps = self.meta.setdefault("preprocessing", [])
+        for s in existing_steps:
+            if str(s.get("name", "")).strip().lower() == step_name.lower():
                 QMessageBox.information(self, "Exists", f"Step '{step_name}' already exists.")
+                self._refresh_steps()
+                for i in range(self.steps.count()):
+                    if self.steps.item(i).text().lower().startswith(step_name.lower() + " ["):
+                        self.steps.setCurrentRow(i)
+                        break
                 return
 
-        step = {"name": step_name, "params": {}, "comments": "", "status": "in_progress"}
-        self.meta.setdefault("preprocessing", []).append(step)
-        save_session_triplet(self.app_state.current_session_path, self.meta)
+        step = {"name": step_name, "params": {}, "comments": "", "status": STEP_STATUS_PLANNED, "results_dir": ""}
+        existing_steps.append(step)
+        self._save_current_session_meta()
         self._refresh_steps()
+        self._refresh_step_choices()
         # select newly added
-        self.steps.setCurrentRow(self.steps.count() - 1)
+        for i in range(self.steps.count()):
+            if self.steps.item(i).text().lower().startswith(step_name.lower() + " ["):
+                self.steps.setCurrentRow(i)
+                break
 
     def _remove_step(self):
         cur = self._current_step()
@@ -553,19 +615,34 @@ class PreprocessingTab(QWidget):
         steps = self.meta.get("preprocessing", [])
         steps = [s for s in steps if s.get("name") != name]
         self.meta["preprocessing"] = steps
-        save_session_triplet(self.app_state.current_session_path, self.meta)
+        self._save_current_session_meta()
         self._refresh_steps()
+        self._refresh_step_choices()
         self.txt_params.clear()
         self.txt_comments.clear()
         self.ed_results_dir.clear()
 
-    def _mark_completed(self):
+    def _set_step_status(self, status: str):
         cur = self._current_step()
         if not cur:
             return
-        cur["status"] = "completed"
-        save_session_triplet(self.app_state.current_session_path, self.meta)
+        cur["status"] = self._normalize_step_status(status)
+        self._save_current_session_meta()
+        selected_name = str(cur.get("name", "")).strip()
         self._refresh_steps()
+        for i in range(self.steps.count()):
+            if self.steps.item(i).text().lower().startswith(selected_name.lower() + " ["):
+                self.steps.setCurrentRow(i)
+                break
+
+    def _mark_planned(self):
+        self._set_step_status(STEP_STATUS_PLANNED)
+
+    def _mark_ongoing(self):
+        self._set_step_status(STEP_STATUS_ONGOING)
+
+    def _mark_completed(self):
+        self._set_step_status(STEP_STATUS_COMPLETED)
 
     def _update_param_comment(self):
         cur = self._current_step()
@@ -574,7 +651,10 @@ class PreprocessingTab(QWidget):
         # Update center widgets from selected step
         self.txt_params.setText(json.dumps(cur.get("params", {}), indent=2))
         self.txt_comments.setText(cur.get("comments", ""))
-        self.ed_results_dir.setText(cur.get("results_dir", ""))
+        results_dir = str(cur.get("results_dir", "")).strip()
+        if not results_dir:
+            results_dir = self._default_step_results_dir(cur.get("name", "step"))
+        self.ed_results_dir.setText(results_dir)
 
     # ------------------------ Params & comments ------------------------
 
@@ -588,7 +668,7 @@ class PreprocessingTab(QWidget):
             QMessageBox.critical(self, "JSON error", str(e))
             return
         cur["params"] = params
-        save_session_triplet(self.app_state.current_session_path, self.meta)
+        self._save_current_session_meta()
 
     def _save_comment(self):
         cur = self._current_step()
@@ -596,7 +676,7 @@ class PreprocessingTab(QWidget):
             return
         txt = self.txt_comments.toPlainText().strip()
         cur["comments"] = txt
-        save_session_triplet(self.app_state.current_session_path, self.meta)
+        self._save_current_session_meta()
 
     # ------------------------ Import params (CSV/JSON) ------------------------
 
@@ -676,7 +756,7 @@ class PreprocessingTab(QWidget):
 
         # Reflect in UI and save
         self.txt_params.setText(json.dumps(cur.get("params", {}), indent=2))
-        save_session_triplet(self.app_state.current_session_path, self.meta)
+        self._save_current_session_meta()
 
     # ------------------------ Results folder per step ------------------------
 
@@ -689,21 +769,46 @@ class PreprocessingTab(QWidget):
             return
         self.ed_results_dir.setText(d)
 
+    def _default_step_results_dir(self, step_name: str) -> str:
+        base = self.ed_proc_root.text().strip() or self._default_processed_session_dir()
+        name = self._sanitize_step_name(step_name).replace(" ", "_")
+        return os.path.join(base, name) if name else base
+
+    def _open_step_folder(self):
+        cur = self._current_step()
+        if not cur:
+            QMessageBox.warning(self, "Step", "Select a preprocessing step first.")
+            return
+        path = self.ed_results_dir.text().strip() or str(cur.get("results_dir", "")).strip()
+        if not path:
+            path = self._default_step_results_dir(str(cur.get("name", "step")))
+            self.ed_results_dir.setText(path)
+            cur["results_dir"] = path
+            self._save_current_session_meta()
+        os.makedirs(path, exist_ok=True)
+        try:
+            if os.name == "nt":
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.run(["open", path], check=False)
+            else:
+                subprocess.run(["xdg-open", path], check=False)
+        except Exception as e:
+            QMessageBox.critical(self, "Open folder", f"Failed to open folder:\n{path}\n\n{e}")
+
     def _apply_results_dir(self):
         cur = self._current_step()
         if not cur:
             return
         cur["results_dir"] = self.ed_results_dir.text().strip()
-        save_session_triplet(self.app_state.current_session_path, self.meta)
+        self._save_current_session_meta()
 
     def _load_settings(self):
         data = self.app_state.settings.get_preprocessing_tab_settings()
         dr = self._normalize_data_root(self.app_state.settings.data_root)
         if dr:
             self.ed_data_root.setText(dr)
-        pr = str(data.get("processed_root", "")).strip()
-        if pr:
-            self.ed_proc_root.setText(pr)
+        self._proc_root_user_edited = False
         for cb, k in (
             (self.cb_proj, "project"),
             (self.cb_exp, "experiment"),
@@ -713,6 +818,7 @@ class PreprocessingTab(QWidget):
             v = str(data.get(k, "")).strip()
             if v:
                 cb.setCurrentText(v)
+        self._update_default_processed_root(force=True)
 
     def _persist_settings(self):
         root = self._normalize_data_root(self.app_state.settings.data_root)

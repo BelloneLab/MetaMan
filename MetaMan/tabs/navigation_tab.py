@@ -25,6 +25,9 @@ from PySide6.QtWidgets import (
 
 from ..io_ops import (
     list_projects,
+    list_experiments,
+    list_subjects,
+    list_sessions,
     load_project_info,
     save_project_info,
     load_experiment_info,
@@ -33,16 +36,6 @@ from ..io_ops import (
     save_subject_info,
     load_session_metadata,
     save_session_triplet,
-)
-from ..services.structure_schema import (
-    build_role_path,
-    collect_hierarchy_entries,
-    is_marker_level,
-    levels_for_kind,
-    list_directory_names,
-    load_project_schema,
-    marker_folder_name,
-    role_label,
 )
 from ..state import AppState
 
@@ -188,7 +181,7 @@ class NavigationTab(QWidget):
         self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.tree.itemSelectionChanged.connect(self._on_select)
         self.tree.itemExpanded.connect(self._on_item_expanded)
-        self.tree.itemDoubleClicked.connect(self._on_tree_double_click)
+        self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         left_layout.addWidget(self.tree, 1)
 
         btns = QHBoxLayout()
@@ -298,62 +291,6 @@ class NavigationTab(QWidget):
         row.addWidget(b_save)
         lay.addLayout(row)
 
-    def _default_schema(self):
-        try:
-            return self.app_state.settings.get_default_structure_schema()
-        except Exception:
-            return {}
-
-    def _project_schema(self, project_name: str):
-        return load_project_schema(
-            self.app_state.settings.raw_root,
-            project_name,
-            fallback=self._default_schema(),
-        )
-
-    def _set_item_payload(
-        self,
-        item: QTreeWidgetItem,
-        role: str,
-        path: str,
-        project: str,
-        schema: Dict[str, Any],
-        values: Dict[str, str],
-        level_index: int,
-    ):
-        item.setData(0, Qt.UserRole, (role, path))
-        item.setData(
-            0,
-            Qt.UserRole + 1,
-            {
-                "project": project,
-                "schema": schema,
-                "values": dict(values),
-                "level_index": int(level_index),
-            },
-        )
-
-    def _item_extras(self, item: Optional[QTreeWidgetItem] = None) -> Dict[str, Any]:
-        target = item
-        if target is None:
-            selected = self.tree.selectedItems()
-            target = selected[0] if selected else self.tree.currentItem()
-        if not target:
-            return {}
-        raw = target.data(0, Qt.UserRole + 1)
-        return raw if isinstance(raw, dict) else {}
-
-    def _refresh_role_labels(self, schema: Dict[str, Any]):
-        project_lbl = role_label(schema, "project", kind="raw")
-        experiment_lbl = role_label(schema, "experiment", kind="raw")
-        subject_lbl = role_label(schema, "subject", kind="raw")
-        session_lbl = role_label(schema, "session", kind="raw")
-
-        self.right_tabs.setTabText(0, f"{project_lbl} Info")
-        self.right_tabs.setTabText(1, f"{experiment_lbl} Info")
-        self.right_tabs.setTabText(2, f"{subject_lbl} Info")
-        self.right_tabs.setTabText(3, f"{session_lbl} Metadata")
-
     def _choose_root(self):
         d = QFileDialog.getExistingDirectory(self, "Choose data root", self.ed_root.text() or "")
         if not d:
@@ -379,23 +316,12 @@ class NavigationTab(QWidget):
         for proj in list_projects(raw_root):
             proj_dir = canon_path(os.path.join(raw_root, proj))
             pitem = QTreeWidgetItem([proj])
-            schema = self._project_schema(proj)
-            self._set_item_payload(
-                pitem,
-                role="project",
-                path=proj_dir,
-                project=proj,
-                schema=schema,
-                values={"project": proj},
-                level_index=0,
-            )
+            pitem.setData(0, Qt.UserRole, ("project", proj_dir))
             self.tree.addTopLevelItem(pitem)
-            levels = levels_for_kind(schema, kind="raw", include_disabled=False)
-            has_children = len(levels) > 1
-            if lazy and has_children:
+            if lazy:
                 pitem.addChild(QTreeWidgetItem([self.DUMMY_CHILD_TEXT]))
-            elif has_children:
-                self._populate_children(pitem, lazy=lazy)
+            else:
+                self._populate_project_children(pitem, proj_dir, lazy)
 
         if collapsed:
             self.tree.collapseAll()
@@ -410,64 +336,47 @@ class NavigationTab(QWidget):
                     break
 
     def _on_item_expanded(self, item: QTreeWidgetItem):
-        extras = self._item_extras(item)
-        if not extras:
+        data = item.data(0, Qt.UserRole)
+        if not data:
             return
+        kind, path = data
         if item.childCount() == 1 and item.child(0).text(0) == self.DUMMY_CHILD_TEXT:
             item.takeChild(0)
-            self._populate_children(item, lazy=True)
+            if kind == "project":
+                self._populate_project_children(item, path, lazy=True)
+            elif kind == "experiment":
+                self._populate_experiment_children(item, path, lazy=True)
+            elif kind == "subject":
+                self._populate_subject_children(item, path)
 
-    def _populate_children(self, parent_item: QTreeWidgetItem, lazy: bool = True):
-        extras = self._item_extras(parent_item)
-        if not extras:
-            return
-        schema = extras.get("schema") or self._default_schema()
-        project = str(extras.get("project", "")).strip()
-        values = dict(extras.get("values") or {})
-        level_index = int(extras.get("level_index", 0))
-        levels = levels_for_kind(schema, kind="raw", include_disabled=False)
-        next_index = level_index + 1
-        if next_index >= len(levels):
-            return
+    def _populate_project_children(self, pitem: QTreeWidgetItem, proj_dir: str, lazy=True):
+        for exp in list_experiments(proj_dir):
+            exp_dir = canon_path(os.path.join(proj_dir, exp))
+            eitem = QTreeWidgetItem([exp])
+            eitem.setData(0, Qt.UserRole, ("experiment", exp_dir))
+            pitem.addChild(eitem)
+            if lazy:
+                eitem.addChild(QTreeWidgetItem([self.DUMMY_CHILD_TEXT]))
+            else:
+                self._populate_experiment_children(eitem, exp_dir, lazy=False)
 
-        next_level = levels[next_index]
-        role = str(next_level.get("key", "")).strip()
-        parent_data = parent_item.data(0, Qt.UserRole)
-        if not parent_data:
-            return
-        _kind, parent_path = parent_data
+    def _populate_experiment_children(self, eitem: QTreeWidgetItem, exp_dir: str, lazy=True):
+        for subject in list_subjects(exp_dir):
+            sub_dir = canon_path(os.path.join(exp_dir, subject))
+            sitem = QTreeWidgetItem([subject])
+            sitem.setData(0, Qt.UserRole, ("subject", sub_dir))
+            eitem.addChild(sitem)
+            if lazy:
+                sitem.addChild(QTreeWidgetItem([self.DUMMY_CHILD_TEXT]))
+            else:
+                self._populate_subject_children(sitem, sub_dir)
 
-        if is_marker_level(role):
-            marker = marker_folder_name(next_level)
-            if not marker:
-                return
-            marker_path = os.path.join(parent_path, marker)
-            if not os.path.isdir(marker_path):
-                return
-            names = [marker]
-        else:
-            names = list_directory_names(parent_path)
-
-        for name in names:
-            child_path = canon_path(os.path.join(parent_path, name))
-            child_item = QTreeWidgetItem([name])
-            child_values = dict(values)
-            child_values[role] = name
-            self._set_item_payload(
-                child_item,
-                role=role,
-                path=child_path,
-                project=project,
-                schema=schema,
-                values=child_values,
-                level_index=next_index,
-            )
-            parent_item.addChild(child_item)
-            if next_index < len(levels) - 1:
-                if lazy:
-                    child_item.addChild(QTreeWidgetItem([self.DUMMY_CHILD_TEXT]))
-                else:
-                    self._populate_children(child_item, lazy=False)
+    def _populate_subject_children(self, sitem: QTreeWidgetItem, sub_dir: str):
+        for sess in list_sessions(sub_dir):
+            sess_dir = canon_path(os.path.join(sub_dir, sess))
+            sess_item = QTreeWidgetItem([sess])
+            sess_item.setData(0, Qt.UserRole, ("session", sess_dir))
+            sitem.addChild(sess_item)
 
     def _get_selected(self) -> Optional[Tuple[str, str, str]]:
         items = self.tree.selectedItems()
@@ -495,54 +404,46 @@ class NavigationTab(QWidget):
         if not sel:
             return
         kind, path, text = sel
-        extras = self._item_extras()
-        values = dict(extras.get("values") or {})
-        project = str(values.get("project", "")).strip()
-        schema = extras.get("schema") or (self._project_schema(project) if project else self._default_schema())
-        self._refresh_role_labels(schema)
 
         if kind == "project":
             self.app_state.settings.last_opened_project = text
             self.app_state.set_current(project=text, experiment="", animal="", session="", session_path="")
             info = self._without_stat_keys(load_project_info(path))
-            dict_to_table(self.tbl_proj, {**self._project_stats(text), **info})
+            dict_to_table(self.tbl_proj, {**self._project_stats(path), **info})
             self.lbl_proj.setText(text)
             self.lbl_proj_path.setText(path)
             self.right_tabs.setCurrentIndex(0)
             return
 
         if kind == "experiment":
-            project = values.get("project", "") or os.path.basename(os.path.dirname(path))
+            project = os.path.basename(os.path.dirname(path))
             self.app_state.set_current(project=project, experiment=text, animal="", session="", session_path="")
             info = self._without_stat_keys(load_experiment_info(path))
-            dict_to_table(self.tbl_exp, {**self._experiment_stats(project, text), **info})
+            dict_to_table(self.tbl_exp, {**self._experiment_stats(path), **info})
             self.lbl_exp.setText(text)
             self.lbl_exp_path.setText(path)
             self.right_tabs.setCurrentIndex(1)
             return
 
         if kind == "subject":
-            experiment = values.get("experiment", "")
-            if not experiment:
-                exp_dir = os.path.dirname(path)
-                experiment = os.path.basename(exp_dir)
-            project = values.get("project", "")
-            if not project:
-                exp_dir = os.path.dirname(path)
-                project = os.path.basename(os.path.dirname(exp_dir))
+            exp_dir = os.path.dirname(path)
+            project = os.path.basename(os.path.dirname(exp_dir))
+            experiment = os.path.basename(exp_dir)
             self.app_state.set_current(project=project, experiment=experiment, animal=text, session="", session_path="")
             info = self._without_stat_keys(load_subject_info(path))
-            dict_to_table(self.tbl_sub, {**self._subject_stats(project, experiment, text), **info})
+            dict_to_table(self.tbl_sub, {**self._subject_stats(path), **info})
             self.lbl_sub.setText(text)
             self.lbl_sub_path.setText(path)
             self.right_tabs.setCurrentIndex(2)
             return
 
         if kind == "session":
-            project = values.get("project", "")
-            experiment = values.get("experiment", "")
-            subject = values.get("subject", "")
-            session = values.get("session", "") or text
+            sub_dir = os.path.dirname(path)
+            exp_dir = os.path.dirname(sub_dir)
+            project = os.path.basename(os.path.dirname(exp_dir))
+            experiment = os.path.basename(exp_dir)
+            subject = os.path.basename(sub_dir)
+            session = os.path.basename(path)
             self.app_state.set_current(
                 project=project,
                 experiment=experiment,
@@ -555,63 +456,42 @@ class NavigationTab(QWidget):
             self.lbl_session_path.setText(path)
             dict_to_table(self.tbl_session, meta)
             self.right_tabs.setCurrentIndex(3)
-            return
 
-        # Generic node (e.g., recording/group/trial): if a session ancestor exists, load that metadata.
-        if values.get("session") and project:
-            session_path = build_role_path(
-                self.app_state.settings.raw_root,
-                schema,
-                values,
-                role="session",
-                kind="raw",
-            )
-            if session_path and os.path.isdir(session_path):
-                meta = load_session_metadata(session_path) or {}
-                self.app_state.set_current(
-                    project=str(values.get("project", "")),
-                    experiment=str(values.get("experiment", "")),
-                    animal=str(values.get("subject", "")),
-                    session=str(values.get("session", "")),
-                    session_path=session_path,
-                )
-                self.lbl_session.setText(str(values.get("session", "")))
-                self.lbl_session_path.setText(session_path)
-                dict_to_table(self.tbl_session, meta)
-                self.right_tabs.setCurrentIndex(3)
-
-    def _project_stats(self, project_name: str) -> Dict[str, Any]:
-        schema = self._project_schema(project_name)
-        entries = collect_hierarchy_entries(
-            self.app_state.settings.raw_root,
-            schema,
-            kind="raw",
-            project_filter=project_name,
-        )
-        experiments = sorted({e.values.get("experiment", "") for e in entries if e.values.get("experiment")})
-        subjects = sorted({e.values.get("subject", "") for e in entries if e.values.get("subject")})
-        session_paths = sorted({e.paths.get("session", "") for e in entries if e.paths.get("session")})
-
-        experimenters = set()
-        dt_list = []
+    def _project_stats(self, proj_dir: str) -> Dict[str, Any]:
+        exp_count = 0
+        subject_count = 0
+        session_count = 0
         total_files = 0
         total_size = 0
-        for sess_path in session_paths:
-            smeta = load_session_metadata(sess_path) or {}
-            if smeta.get("Experimenter"):
-                experimenters.add(str(smeta.get("Experimenter")))
-            if smeta.get("DateTime"):
-                dt_list.append(str(smeta.get("DateTime")))
-            for item in smeta.get("file_list", []):
-                total_files += 1
-                if isinstance(item, dict) and isinstance(item.get("size"), int):
-                    total_size += int(item["size"])
+        experiments = set()
+        experimenters = set()
+        dt_list = []
+
+        for exp in list_experiments(proj_dir):
+            exp_count += 1
+            exp_dir = os.path.join(proj_dir, exp)
+            for sub in list_subjects(exp_dir):
+                subject_count += 1
+                sub_dir = os.path.join(exp_dir, sub)
+                for sess in list_sessions(sub_dir):
+                    session_count += 1
+                    smeta = load_session_metadata(os.path.join(sub_dir, sess)) or {}
+                    if smeta.get("Experiment"):
+                        experiments.add(str(smeta.get("Experiment")))
+                    if smeta.get("Experimenter"):
+                        experimenters.add(str(smeta.get("Experimenter")))
+                    if smeta.get("DateTime"):
+                        dt_list.append(str(smeta.get("DateTime")))
+                    for item in smeta.get("file_list", []):
+                        total_files += 1
+                        if isinstance(item, dict) and isinstance(item.get("size"), int):
+                            total_size += int(item["size"])
 
         return {
-            "stats_experiments_count": len(experiments),
-            "stats_subjects_count": len(subjects),
-            "stats_sessions_total": len(session_paths),
-            "stats_experiments": ", ".join(experiments) if experiments else "",
+            "stats_experiments_count": exp_count,
+            "stats_subjects_count": subject_count,
+            "stats_sessions_total": session_count,
+            "stats_experiments": ", ".join(sorted(experiments)) if experiments else "",
             "stats_experimenters": ", ".join(sorted(experimenters)) if experimenters else "",
             "stats_first_session": min(dt_list) if dt_list else "",
             "stats_last_session": max(dt_list) if dt_list else "",
@@ -620,37 +500,33 @@ class NavigationTab(QWidget):
             "stats_total_size_human": human_size(total_size),
         }
 
-    def _experiment_stats(self, project_name: str, experiment_name: str) -> Dict[str, Any]:
-        schema = self._project_schema(project_name)
-        entries = collect_hierarchy_entries(
-            self.app_state.settings.raw_root,
-            schema,
-            kind="raw",
-            project_filter=project_name,
-        )
-        selected = [e for e in entries if e.values.get("experiment") == experiment_name]
-        subjects = sorted({e.values.get("subject", "") for e in selected if e.values.get("subject")})
-        session_paths = sorted({e.paths.get("session", "") for e in selected if e.paths.get("session")})
-
+    def _experiment_stats(self, exp_dir: str) -> Dict[str, Any]:
+        subjects = list_subjects(exp_dir)
+        sessions_total = 0
         rec_types = set()
         dt_list = []
         total_files = 0
         total_size = 0
-        for sess_path in session_paths:
-            smeta = load_session_metadata(sess_path) or {}
-            rt = str(smeta.get("Recording") or "").strip()
-            if rt:
-                rec_types.add(rt)
-            if smeta.get("DateTime"):
-                dt_list.append(str(smeta.get("DateTime")))
-            for item in smeta.get("file_list", []):
-                total_files += 1
-                if isinstance(item, dict) and isinstance(item.get("size"), int):
-                    total_size += int(item["size"])
+
+        for sub in subjects:
+            sub_dir = os.path.join(exp_dir, sub)
+            sessions = list_sessions(sub_dir)
+            sessions_total += len(sessions)
+            for sess in sessions:
+                smeta = load_session_metadata(os.path.join(sub_dir, sess)) or {}
+                rt = str(smeta.get("Recording") or "").strip()
+                if rt:
+                    rec_types.add(rt)
+                if smeta.get("DateTime"):
+                    dt_list.append(str(smeta.get("DateTime")))
+                for item in smeta.get("file_list", []):
+                    total_files += 1
+                    if isinstance(item, dict) and isinstance(item.get("size"), int):
+                        total_size += int(item["size"])
 
         return {
             "stats_subjects_count": len(subjects),
-            "stats_sessions_total": len(session_paths),
+            "stats_sessions_total": sessions_total,
             "stats_recording_types": ", ".join(sorted(rec_types)) if rec_types else "",
             "stats_first_session": min(dt_list) if dt_list else "",
             "stats_last_session": max(dt_list) if dt_list else "",
@@ -659,27 +535,15 @@ class NavigationTab(QWidget):
             "stats_size_human": human_size(total_size),
         }
 
-    def _subject_stats(self, project_name: str, experiment_name: str, subject_name: str) -> Dict[str, Any]:
-        schema = self._project_schema(project_name)
-        entries = collect_hierarchy_entries(
-            self.app_state.settings.raw_root,
-            schema,
-            kind="raw",
-            project_filter=project_name,
-        )
-        selected = [
-            e
-            for e in entries
-            if e.values.get("experiment") == experiment_name and e.values.get("subject") == subject_name
-        ]
-        session_paths = sorted({e.paths.get("session", "") for e in selected if e.paths.get("session")})
-
+    def _subject_stats(self, subject_dir: str) -> Dict[str, Any]:
+        sessions = list_sessions(subject_dir)
         rec_types = set()
         dt_list = []
         total_files = 0
         total_size = 0
-        for sess_path in session_paths:
-            smeta = load_session_metadata(sess_path) or {}
+
+        for sess in sessions:
+            smeta = load_session_metadata(os.path.join(subject_dir, sess)) or {}
             rt = str(smeta.get("Recording") or "").strip()
             if rt:
                 rec_types.add(rt)
@@ -691,7 +555,7 @@ class NavigationTab(QWidget):
                     total_size += int(item["size"])
 
         return {
-            "stats_sessions_total": len(session_paths),
+            "stats_sessions_total": len(sessions),
             "stats_recording_types": ", ".join(sorted(rec_types)) if rec_types else "",
             "stats_first_session": min(dt_list) if dt_list else "",
             "stats_last_session": max(dt_list) if dt_list else "",
@@ -756,30 +620,21 @@ class NavigationTab(QWidget):
         if not sel:
             return
         kind, path, _ = sel
-        session_path = ""
-        if kind == "session":
-            session_path = path
-        else:
-            extras = self._item_extras()
-            values = dict(extras.get("values") or {})
-            schema = extras.get("schema") or self._default_schema()
-            if values.get("session"):
-                session_path = build_role_path(
-                    self.app_state.settings.raw_root,
-                    schema,
-                    values,
-                    role="session",
-                    kind="raw",
-                )
-        if not session_path or not os.path.isdir(session_path):
-            QMessageBox.warning(self, "Select session", "Please select a session node (or a child of a session).")
+        if kind != "session":
+            QMessageBox.warning(self, "Select session", "Please select a session node.")
             return
-        self.on_load_session(session_path)
+        self.on_load_session(path)
 
-    def _on_tree_double_click(self, item: QTreeWidgetItem, _column: int):
-        if not item:
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, _column: int):
+        if item is None:
             return
-        self._load_selected_session()
+        data = item.data(0, Qt.UserRole)
+        if not data:
+            return
+        kind, path = data
+        if kind != "session":
+            return
+        self.on_load_session(path)
 
     def _add_row(self, tbl: QTableWidget):
         r = tbl.rowCount()
@@ -827,24 +682,11 @@ class NavigationTab(QWidget):
         if not sel:
             return
         kind, path, _ = sel
-        session_path = path if kind == "session" else ""
-        if not session_path:
-            extras = self._item_extras()
-            values = dict(extras.get("values") or {})
-            schema = extras.get("schema") or self._default_schema()
-            if values.get("session"):
-                session_path = build_role_path(
-                    self.app_state.settings.raw_root,
-                    schema,
-                    values,
-                    role="session",
-                    kind="raw",
-                )
-        if not session_path or not os.path.isdir(session_path):
+        if kind != "session":
             QMessageBox.warning(self, "Selection", "Select a session node first.")
             return
         data = table_to_dict(self.tbl_session)
-        save_session_triplet(session_path, data)
+        save_session_triplet(path, data)
         QMessageBox.information(self, "Saved", "Session metadata saved.")
 
     def _load_subject_csv(self):
@@ -922,30 +764,18 @@ class NavigationTab(QWidget):
 
         if projects:
             path, _text = projects[0]
-            project_name = os.path.basename(path.rstrip("\\/"))
-            schema = self._project_schema(project_name)
-            entries = collect_hierarchy_entries(
-                self.app_state.settings.raw_root,
-                schema,
-                kind="raw",
-                project_filter=project_name,
-            )
-            subject_nodes = {
-                canon_path(e.paths.get("subject", "")): e.values.get("subject", "")
-                for e in entries
-                if e.paths.get("subject")
-            }
             updated = 0
-            for sub_dir, subject in subject_nodes.items():
-                if not subject:
-                    continue
-                matches = df[df["_ID5"] == last5(subject)]
-                if matches.empty:
-                    continue
-                existing = load_subject_info(sub_dir)
-                existing.update(row_to_info(matches.iloc[0].to_dict()))
-                save_subject_info(sub_dir, existing)
-                updated += 1
+            for exp in list_experiments(path):
+                exp_dir = os.path.join(path, exp)
+                for subject in list_subjects(exp_dir):
+                    matches = df[df["_ID5"] == last5(subject)]
+                    if matches.empty:
+                        continue
+                    sub_dir = os.path.join(exp_dir, subject)
+                    existing = load_subject_info(sub_dir)
+                    existing.update(row_to_info(matches.iloc[0].to_dict()))
+                    save_subject_info(sub_dir, existing)
+                    updated += 1
             QMessageBox.information(self, "Import complete", f"Updated {updated} subjects in project.")
         else:
             updated = 0

@@ -26,18 +26,6 @@ data_root/
 
 It is built for fast navigation, safe copy workflows, metadata consistency, and reproducible structure.
 
-### Custom hierarchy designer
-
-You can now define your own folder schema per project:
-- Open **File -> Design Data Structure...**
-- Drag and reorder level blocks
-- Rename level labels (for example `Session` -> `RecordingDate`)
-- Add fixed `raw` / `processed` blocks anywhere in the chain (for nested raw/processed layouts)
-- Save as default for new projects or override one existing project
-
-Core level compatibility is preserved in this order:
-`project -> experiment -> subject -> session`
-
 ---
 
 ## Quick Start

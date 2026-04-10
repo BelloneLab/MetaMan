@@ -18,7 +18,6 @@ class AppSettings:
             "data_reorganizer_settings": {},
             "recording_tab_settings": {},
             "preprocessing_tab_settings": {},
-            "default_structure_schema": {},
         }
         self.load()
         self.ensure_storage_roots()
@@ -255,20 +254,6 @@ class AppSettings:
 
     def put_data_reorganizer_settings(self, data: Dict[str, Any]):
         self._data["data_reorganizer_settings"] = dict(data or {})
-        self.save()
-
-    def get_default_structure_schema(self) -> Dict[str, Any]:
-        from .services.structure_schema import default_structure_schema, normalize_structure_schema
-
-        raw = self._data.get("default_structure_schema") or {}
-        if isinstance(raw, dict) and raw:
-            return normalize_structure_schema(raw)
-        return default_structure_schema()
-
-    def put_default_structure_schema(self, schema: Dict[str, Any]):
-        from .services.structure_schema import normalize_structure_schema
-
-        self._data["default_structure_schema"] = normalize_structure_schema(schema or {})
         self.save()
 
     @property

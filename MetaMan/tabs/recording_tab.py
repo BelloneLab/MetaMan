@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime
 from typing import Any, Dict, List
 
 from PySide6.QtCore import Qt
@@ -23,20 +24,15 @@ from PySide6.QtWidgets import (
 )
 
 from ..io_ops import (
+    list_experiments,
     list_projects,
+    list_sessions,
+    list_subjects,
     load_session_metadata,
     save_session_triplet,
 )
 from ..models import SessionMetadata
 from ..services.file_scanner import scan_file_list
-from ..services.structure_schema import (
-    build_role_path,
-    extract_values_from_path,
-    list_role_values,
-    load_project_schema,
-    role_enabled,
-    role_label,
-)
 from ..state import AppState
 from ..utils import LogEmitter, run_in_thread
 
@@ -69,7 +65,6 @@ class RecordingTab(QWidget):
         self.app_state = app_state
         self.meta: Dict[str, Any] = {}
         self._loading_session = False
-        self._active_schema = self._default_schema()
         self._build_ui()
         self._load_settings()
         self._refresh_lists()
@@ -105,33 +100,29 @@ class RecordingTab(QWidget):
         left_vbox.addLayout(row1)
 
         row2 = QHBoxLayout()
-        self.lbl_project = QLabel("Project")
-        row2.addWidget(self.lbl_project)
+        row2.addWidget(QLabel("Project"))
         self.cb_proj = QComboBox()
         self.cb_proj.setEditable(False)
         row2.addWidget(self.cb_proj, 1)
-        self.lbl_experiment = QLabel("Experiment")
-        row2.addWidget(self.lbl_experiment)
+        row2.addWidget(QLabel("Experiment"))
         self.cb_exp = QComboBox()
         self.cb_exp.setEditable(False)
         row2.addWidget(self.cb_exp, 1)
         left_vbox.addLayout(row2)
 
         row3 = QHBoxLayout()
-        self.lbl_subject = QLabel("Subject")
-        row3.addWidget(self.lbl_subject)
+        row3.addWidget(QLabel("Subject"))
         self.cb_sub = QComboBox()
-        self.cb_sub.setEditable(False)
+        self.cb_sub.setEditable(True)
         row3.addWidget(self.cb_sub, 1)
-        b_new_sub = QPushButton("New")
+        b_new_sub = QPushButton("New subject")
         b_new_sub.clicked.connect(self._prompt_new_subject)
         row3.addWidget(b_new_sub)
-        self.lbl_session = QLabel("Session")
-        row3.addWidget(self.lbl_session)
+        row3.addWidget(QLabel("Session"))
         self.cb_sess = QComboBox()
-        self.cb_sess.setEditable(False)
+        self.cb_sess.setEditable(True)
         row3.addWidget(self.cb_sess, 1)
-        b_new_sess = QPushButton("New")
+        b_new_sess = QPushButton("New session")
         b_new_sess.clicked.connect(self._prompt_new_session)
         row3.addWidget(b_new_sess)
         left_vbox.addLayout(row3)
@@ -147,6 +138,8 @@ class RecordingTab(QWidget):
         self.cb_sub.currentIndexChanged.connect(lambda _i: self._persist_settings())
         self.cb_sess.currentIndexChanged.connect(self._on_session_changed)
         self.cb_sess.currentIndexChanged.connect(lambda _i: self._persist_settings())
+        self.cb_sub.currentTextChanged.connect(lambda _t: self._persist_settings())
+        self.cb_sess.currentTextChanged.connect(lambda _t: self._persist_settings())
         self.ed_root.textChanged.connect(self._persist_settings)
 
         self.tbl_meta = QTableWidget(0, 2)
@@ -241,39 +234,6 @@ class RecordingTab(QWidget):
         main_split.addWidget(right_panel)
         main_split.setSizes([920, 360])
 
-    def _default_schema(self):
-        try:
-            return self.app_state.settings.get_default_structure_schema()
-        except Exception:
-            return {}
-
-    def _project_schema(self, project_name: str):
-        return load_project_schema(
-            self._raw_root(),
-            project_name,
-            fallback=self._default_schema(),
-        )
-
-    def _current_schema(self):
-        project = self._current_project()
-        if project:
-            self._active_schema = self._project_schema(project)
-        return self._active_schema
-
-    def _update_role_labels(self):
-        schema = self._current_schema()
-        self.lbl_project.setText(role_label(schema, "project", kind="raw"))
-        self.lbl_experiment.setText(role_label(schema, "experiment", kind="raw"))
-        self.lbl_subject.setText(role_label(schema, "subject", kind="raw"))
-        self.lbl_session.setText(role_label(schema, "session", kind="raw"))
-
-        exp_enabled = role_enabled(schema, "experiment", kind="raw")
-        sub_enabled = role_enabled(schema, "subject", kind="raw")
-        sess_enabled = role_enabled(schema, "session", kind="raw")
-        self.cb_exp.setEnabled(exp_enabled)
-        self.cb_sub.setEnabled(sub_enabled)
-        self.cb_sess.setEnabled(sess_enabled)
-
     def _choose_root(self):
         d = QFileDialog.getExistingDirectory(self, "Choose data root", self.ed_root.text() or "")
         if not d:
@@ -354,22 +314,6 @@ class RecordingTab(QWidget):
         return self.cb_sess.currentText().strip()
 
     def _session_dir(self) -> str:
-        schema = self._current_schema()
-        values = {
-            "project": self._current_project(),
-            "experiment": self._current_experiment(),
-            "subject": self._current_subject(),
-            "session": self._current_session(),
-        }
-        path = build_role_path(
-            self._raw_root(),
-            schema,
-            values,
-            role="session",
-            kind="raw",
-        )
-        if path:
-            return path
         return os.path.join(
             self._raw_root(),
             self._current_project(),
@@ -410,42 +354,32 @@ class RecordingTab(QWidget):
         cb.setCurrentText(text)
 
     def _prompt_new_subject(self):
-        schema = self._current_schema()
-        subject_lbl = role_label(schema, "subject", kind="raw")
-        if not role_enabled(schema, "subject", kind="raw"):
-            QMessageBox.warning(self, subject_lbl, f"{subject_lbl} level is disabled in this project's schema.")
-            return
         project = self._current_project()
         experiment = self._current_experiment()
         if not project or not experiment:
-            QMessageBox.warning(self, f"New {subject_lbl}", "Select project and experiment first.")
+            QMessageBox.warning(self, "New subject", "Select project and experiment first.")
             return
-        text, ok = QInputDialog.getText(self, f"New {subject_lbl}", f"{subject_lbl} name:")
+        text, ok = QInputDialog.getText(self, "New subject", "Subject ID:")
         if not ok:
             return
         subject = self._sanitize_entry_name(text)
         if not subject:
-            QMessageBox.warning(self, f"New {subject_lbl}", f"{subject_lbl} cannot be empty.")
+            QMessageBox.warning(self, "New subject", "Subject ID cannot be empty.")
             return
         self._ensure_combo_has_value(self.cb_sub, subject)
         self._on_subject_changed()
         self._persist_settings()
 
     def _prompt_new_session(self):
-        schema = self._current_schema()
-        session_lbl = role_label(schema, "session", kind="raw")
-        if not role_enabled(schema, "session", kind="raw"):
-            QMessageBox.warning(self, session_lbl, f"{session_lbl} level is disabled in this project's schema.")
-            return
         if not self._current_subject():
-            QMessageBox.warning(self, f"New {session_lbl}", "Select or create a subject first.")
+            QMessageBox.warning(self, "New session", "Select or create a subject first.")
             return
-        text, ok = QInputDialog.getText(self, f"New {session_lbl}", f"{session_lbl} name:")
+        text, ok = QInputDialog.getText(self, "New session", "Session ID:")
         if not ok:
             return
         session = self._sanitize_entry_name(text)
         if not session:
-            QMessageBox.warning(self, f"New {session_lbl}", f"{session_lbl} cannot be empty.")
+            QMessageBox.warning(self, "New session", "Session ID cannot be empty.")
             return
         self._ensure_combo_has_value(self.cb_sess, session)
         self._persist_settings()
@@ -465,21 +399,11 @@ class RecordingTab(QWidget):
 
     def _on_project_changed(self, _index: int = -1):
         proj = self._current_project()
-        self._active_schema = self._project_schema(proj) if proj else self._default_schema()
-        self._update_role_labels()
         exp_keep = self._current_experiment()
-        schema = self._current_schema()
-        exp_items = (
-            list_role_values(
-                self._raw_root(),
-                schema,
-                role="experiment",
-                filters={"project": proj},
-                kind="raw",
-            )
-            if proj
-            else []
-        )
+        if proj:
+            exp_items = list_experiments(os.path.join(self._raw_root(), proj))
+        else:
+            exp_items = []
         self._set_combo_items(self.cb_exp, exp_items, exp_keep)
         self._on_experiment_changed()
 
@@ -487,18 +411,10 @@ class RecordingTab(QWidget):
         proj = self._current_project()
         exp = self._current_experiment()
         sub_keep = self._current_subject()
-        schema = self._current_schema()
-        sub_items = (
-            list_role_values(
-                self._raw_root(),
-                schema,
-                role="subject",
-                filters={"project": proj, "experiment": exp},
-                kind="raw",
-            )
-            if proj and exp
-            else []
-        )
+        if proj and exp:
+            sub_items = list_subjects(os.path.join(self._raw_root(), proj, exp))
+        else:
+            sub_items = []
         self._set_combo_items(self.cb_sub, sub_items, sub_keep)
         self._on_subject_changed()
 
@@ -507,18 +423,10 @@ class RecordingTab(QWidget):
         exp = self._current_experiment()
         sub = self._current_subject()
         sess_keep = self._current_session()
-        schema = self._current_schema()
-        sess_items = (
-            list_role_values(
-                self._raw_root(),
-                schema,
-                role="session",
-                filters={"project": proj, "experiment": exp, "subject": sub},
-                kind="raw",
-            )
-            if proj and exp and sub
-            else []
-        )
+        if proj and exp and sub:
+            sess_items = list_sessions(os.path.join(self._raw_root(), proj, exp, sub))
+        else:
+            sess_items = []
         self._set_combo_items(self.cb_sess, sess_items, sess_keep)
         self._persist_settings()
 
@@ -545,15 +453,13 @@ class RecordingTab(QWidget):
     def load_session(self, session_dir: str):
         meta = load_session_metadata(session_dir) or {}
         if not meta:
-            root = self._raw_root()
-            rel_parts = [p for p in os.path.relpath(session_dir, root).split(os.sep) if p and p != "."]
-            project = rel_parts[0] if rel_parts else ""
-            schema = self._project_schema(project) if project else self._default_schema()
-            vals = extract_values_from_path(root, schema, session_dir, kind="raw")
-            project = vals.get("project", project)
-            experiment = vals.get("experiment", "")
-            subject = vals.get("subject", "")
-            session = vals.get("session", os.path.basename(session_dir))
+            sub_dir = os.path.dirname(session_dir)
+            exp_dir = os.path.dirname(sub_dir)
+            proj_dir = os.path.dirname(exp_dir)
+            project = os.path.basename(proj_dir)
+            experiment = os.path.basename(exp_dir)
+            subject = os.path.basename(sub_dir)
+            session = os.path.basename(session_dir)
             meta = SessionMetadata.new(project, subject, session, self._raw_root()).data
             meta["Experiment"] = experiment
             meta["Subject"] = subject
@@ -565,8 +471,7 @@ class RecordingTab(QWidget):
             self._refresh_lists()
 
         try:
-            project_name = str(meta.get("Project", ""))
-            self.cb_proj.setCurrentText(project_name)
+            self.cb_proj.setCurrentText(str(meta.get("Project", "")))
             self._on_project_changed()
             self.cb_exp.setCurrentText(str(meta.get("Experiment", "")))
             self._on_experiment_changed()
@@ -594,59 +499,65 @@ class RecordingTab(QWidget):
 
     def new_recording(self):
         self._ensure_root_dirs()
-        schema = self._current_schema()
         project = self._current_project()
         experiment = self._current_experiment()
         subject = self._current_subject()
-        session = self._current_session() or "1"
-
-        required = ["project"]
-        if role_enabled(schema, "experiment", kind="raw"):
-            required.append("experiment")
-        if role_enabled(schema, "subject", kind="raw"):
-            required.append("subject")
-        if role_enabled(schema, "session", kind="raw"):
-            required.append("session")
-
-        values = {
-            "project": project,
-            "experiment": experiment,
-            "subject": subject,
-            "session": session,
-        }
-        missing = [k for k in required if not str(values.get(k, "")).strip()]
-        if missing:
-            labels = [role_label(schema, k, kind="raw") for k in missing]
-            QMessageBox.warning(self, "Missing fields", "Fill: " + ", ".join(labels))
+        session = self._current_session()
+        if not (project and experiment and subject and session):
+            QMessageBox.warning(self, "Missing fields", "Fill Project, Experiment, Subject, Session.")
             return
 
-        if role_enabled(schema, "session", kind="raw"):
-            target_role = "session"
-        elif role_enabled(schema, "subject", kind="raw"):
-            target_role = "subject"
-        elif role_enabled(schema, "experiment", kind="raw"):
-            target_role = "experiment"
-        else:
-            target_role = "project"
+        project_dir = os.path.join(self._raw_root(), project)
+        experiment_dir = os.path.join(project_dir, experiment)
+        subject_dir = os.path.join(experiment_dir, subject)
+        session_dir = os.path.join(subject_dir, session)
+        for d in (project_dir, experiment_dir, subject_dir, session_dir):
+            os.makedirs(d, exist_ok=True)
 
-        session_dir = build_role_path(
-            self._raw_root(),
-            schema,
-            values,
-            role=target_role,
-            kind="raw",
-        )
-        if not session_dir:
-            session_dir = self._session_dir()
-        os.makedirs(session_dir, exist_ok=True)
-
-        meta = SessionMetadata.new(project, subject, session, self._raw_root()).data
-        meta["Experiment"] = experiment
-        meta["Subject"] = subject
+        meta = self._new_recording_metadata(project, experiment, subject, session)
         self.meta = meta
         save_session_triplet(session_dir, self.meta, logger=self.logger.log)
         self.load_session(session_dir)
         self._persist_settings()
+
+    def _new_recording_metadata(self, project: str, experiment: str, subject: str, session: str) -> Dict[str, Any]:
+        # Keep schema keys, but start non-identifying fields empty for new recordings.
+        meta = SessionMetadata.new(project, subject, session, self._raw_root()).data
+        keep_keys = {
+            "DateTime",
+            "Project",
+            "Experiment",
+            "Animal",
+            "Subject",
+            "Session",
+            "RootDir",
+            "SessionUUID",
+            "file_list",
+            "trial_info",
+            "trial_assets",
+            "preprocessing",
+        }
+        for k in list(meta.keys()):
+            if k in keep_keys:
+                continue
+            v = meta.get(k)
+            if isinstance(v, list):
+                meta[k] = []
+            elif isinstance(v, dict):
+                meta[k] = {}
+            else:
+                meta[k] = ""
+        meta["Project"] = project
+        meta["Experiment"] = experiment
+        meta["Animal"] = subject
+        meta["Subject"] = subject
+        meta["Session"] = str(session)
+        meta["DateTime"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        meta["file_list"] = []
+        meta["trial_info"] = {}
+        meta["trial_assets"] = {}
+        meta["preprocessing"] = []
+        return meta
 
     def update_file_list(self):
         session_dir = self._session_dir()
@@ -662,15 +573,12 @@ class RecordingTab(QWidget):
             srv_root = self.app_state.settings.get_server_root_for_project(self.meta.get("Project", ""))
             if srv_root and os.path.isdir(srv_root):
                 proj = self.meta.get("Project", "")
+                exp = self.meta.get("Experiment", "")
+                subject = self.meta.get("Subject", "") or self.meta.get("Animal", "")
+                session = self.meta.get("Session", "")
                 server_proj = os.path.join(srv_root, proj)
-                local_proj = os.path.join(self._raw_root(), proj)
                 for item in self.meta["file_list"]:
-                    src_path = item.get("path", "")
-                    try:
-                        rel = os.path.relpath(src_path, local_proj)
-                        spath = os.path.join(server_proj, rel)
-                    except Exception:
-                        spath = ""
+                    spath = item["path"].replace(session_dir, os.path.join(server_proj, exp, subject, session))
                     item["server_path"] = spath if os.path.exists(spath) else ""
                 save_session_triplet(session_dir, self.meta, logger=self.logger.log)
                 self.logger.log("Server presence annotated in metadata.")
