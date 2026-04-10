@@ -18,6 +18,10 @@ class AppSettings:
             "data_reorganizer_settings": {},
             "recording_tab_settings": {},
             "preprocessing_tab_settings": {},
+            "staging_tab_settings": {},
+            "loaded_project": {},
+            "structure_schema": {},
+            "structure_schemas_by_project": {},
         }
         self.load()
         self.ensure_storage_roots()
@@ -254,6 +258,48 @@ class AppSettings:
 
     def put_data_reorganizer_settings(self, data: Dict[str, Any]):
         self._data["data_reorganizer_settings"] = dict(data or {})
+        self.save()
+
+    def get_staging_tab_settings(self) -> Dict[str, Any]:
+        raw = self._data.get("staging_tab_settings") or {}
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def put_staging_tab_settings(self, data: Dict[str, Any]):
+        self._data["staging_tab_settings"] = dict(data or {})
+        self.save()
+
+    def get_loaded_project(self) -> Dict[str, str]:
+        proj = self._data.get("loaded_project") or {}
+        return {
+            "name": str(proj.get("name", "")),
+            "source_path": str(proj.get("source_path", "")),
+            "source_type": str(proj.get("source_type", "")),
+            "destination_path": str(proj.get("destination_path", "")),
+        }
+
+    def put_loaded_project(self, name: str, source_path: str, source_type: str, destination_path: str):
+        self._data["loaded_project"] = {
+            "name": name, "source_path": source_path,
+            "source_type": source_type, "destination_path": destination_path,
+        }
+        self.save()
+
+    def get_structure_schema(self) -> Dict[str, Any]:
+        raw = self._data.get("structure_schema") or {}
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def put_structure_schema(self, schema: Dict[str, Any]):
+        self._data["structure_schema"] = dict(schema or {})
+        self.save()
+
+    def get_project_structure_schema(self, project: str) -> Dict[str, Any]:
+        schemas = self._data.get("structure_schemas_by_project") or {}
+        raw = schemas.get(project, {}) if isinstance(schemas, dict) else {}
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def put_project_structure_schema(self, project: str, schema: Dict[str, Any]):
+        d = self._data.setdefault("structure_schemas_by_project", {})
+        d[project] = dict(schema or {})
         self.save()
 
     @property

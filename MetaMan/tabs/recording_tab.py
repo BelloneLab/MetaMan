@@ -9,7 +9,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -25,7 +24,6 @@ from PySide6.QtWidgets import (
 
 from ..io_ops import (
     list_experiments,
-    list_projects,
     list_sessions,
     list_subjects,
     load_session_metadata,
@@ -35,6 +33,7 @@ from ..models import SessionMetadata
 from ..services.file_scanner import scan_file_list
 from ..state import AppState
 from ..utils import LogEmitter, run_in_thread
+from ..side_panel import SidePanelLayout
 
 
 def dict_to_table(tbl: QTableWidget, data: Dict[str, Any]):
@@ -67,7 +66,7 @@ class RecordingTab(QWidget):
         self._loading_session = False
         self._build_ui()
         self._load_settings()
-        self._refresh_lists()
+        self._refresh_from_project()
         if self.app_state.current_session_path and os.path.isdir(self.app_state.current_session_path):
             self.load_session(self.app_state.current_session_path)
         else:
@@ -75,234 +74,157 @@ class RecordingTab(QWidget):
             if last and os.path.isdir(last):
                 self.load_session(last)
 
+    # ── UI ─────────────────────────────────────────────────────────
+
     def _build_ui(self):
-        root = QHBoxLayout(self)
-        main_split = QSplitter(Qt.Horizontal)
-        root.addWidget(main_split)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
 
-        # Left
-        left_panel = QWidget()
-        left_vbox = QVBoxLayout(left_panel)
+        self._side = SidePanelLayout()
+        root.addWidget(self._side, 1)
 
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Data root:"))
-        self.ed_root = QLineEdit(self.app_state.settings.data_root)
-        row1.addWidget(self.ed_root, 1)
-        b_browse = QPushButton("Browse...")
-        b_browse.clicked.connect(self._choose_root)
-        row1.addWidget(b_browse)
-        b_reload = QPushButton("Refresh lists")
-        b_reload.clicked.connect(self._refresh_lists)
-        row1.addWidget(b_reload)
-        b_new = QPushButton("New recording")
-        b_new.clicked.connect(self.new_recording)
-        row1.addWidget(b_new)
-        left_vbox.addLayout(row1)
+        # Panel 0 – Setup ─────────────────────────────────────────
+        setup = QWidget()
+        sl = QVBoxLayout(setup)
 
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("Project"))
-        self.cb_proj = QComboBox()
-        self.cb_proj.setEditable(False)
-        row2.addWidget(self.cb_proj, 1)
-        row2.addWidget(QLabel("Experiment"))
-        self.cb_exp = QComboBox()
-        self.cb_exp.setEditable(False)
-        row2.addWidget(self.cb_exp, 1)
-        left_vbox.addLayout(row2)
+        # Loaded project (read-only)
+        row_proj = QHBoxLayout()
+        row_proj.addWidget(QLabel("Project:"))
+        self.lbl_project = QLabel("(none)")
+        self.lbl_project.setStyleSheet("font-weight: 600;")
+        row_proj.addWidget(self.lbl_project, 1)
+        b_refresh = QPushButton("Refresh")
+        b_refresh.clicked.connect(self._refresh_from_project)
+        row_proj.addWidget(b_refresh)
+        sl.addLayout(row_proj)
 
-        row3 = QHBoxLayout()
-        row3.addWidget(QLabel("Subject"))
-        self.cb_sub = QComboBox()
-        self.cb_sub.setEditable(True)
-        row3.addWidget(self.cb_sub, 1)
-        b_new_sub = QPushButton("New subject")
-        b_new_sub.clicked.connect(self._prompt_new_subject)
-        row3.addWidget(b_new_sub)
-        row3.addWidget(QLabel("Session"))
-        self.cb_sess = QComboBox()
-        self.cb_sess.setEditable(True)
-        row3.addWidget(self.cb_sess, 1)
-        b_new_sess = QPushButton("New session")
-        b_new_sess.clicked.connect(self._prompt_new_session)
-        row3.addWidget(b_new_sess)
-        left_vbox.addLayout(row3)
+        # Destination path
+        row_dest = QHBoxLayout()
+        row_dest.addWidget(QLabel("Destination:"))
+        self.ed_dest = QLineEdit()
+        self.ed_dest.setPlaceholderText("Local folder for recordings")
+        row_dest.addWidget(self.ed_dest, 1)
+        b_dest = QPushButton("Browse\u2026")
+        b_dest.clicked.connect(self._choose_destination)
+        row_dest.addWidget(b_dest)
+        sl.addLayout(row_dest)
 
-        for cb in (self.cb_proj, self.cb_exp, self.cb_sub, self.cb_sess):
-            cb.setMaxVisibleItems(30)
+        # Experiment
+        row_exp = QHBoxLayout()
+        row_exp.addWidget(QLabel("Experiment"))
+        self.cb_exp = QComboBox(); self.cb_exp.setEditable(True)
+        self.cb_exp.setMaxVisibleItems(30)
+        row_exp.addWidget(self.cb_exp, 1)
+        sl.addLayout(row_exp)
 
-        self.cb_proj.currentIndexChanged.connect(self._on_project_changed)
+        # Subject + Session
+        row_sub = QHBoxLayout()
+        row_sub.addWidget(QLabel("Subject"))
+        self.cb_sub = QComboBox(); self.cb_sub.setEditable(True)
+        self.cb_sub.setMaxVisibleItems(30)
+        row_sub.addWidget(self.cb_sub, 1)
+        row_sub.addWidget(QLabel("Session"))
+        self.cb_sess = QComboBox(); self.cb_sess.setEditable(True)
+        self.cb_sess.setMaxVisibleItems(30)
+        row_sub.addWidget(self.cb_sess, 1)
+        sl.addLayout(row_sub)
+
+        b_new_rec = QPushButton("New recording")
+        b_new_rec.clicked.connect(self.new_recording)
+        sl.addWidget(b_new_rec)
+
+        sl.addStretch(1)
+
         self.cb_exp.currentIndexChanged.connect(self._on_experiment_changed)
         self.cb_sub.currentIndexChanged.connect(self._on_subject_changed)
-        self.cb_proj.currentIndexChanged.connect(lambda _i: self._persist_settings())
-        self.cb_exp.currentIndexChanged.connect(lambda _i: self._persist_settings())
-        self.cb_sub.currentIndexChanged.connect(lambda _i: self._persist_settings())
+        self.cb_exp.currentTextChanged.connect(lambda _: self._persist_settings())
+        self.cb_sub.currentTextChanged.connect(lambda _: self._persist_settings())
         self.cb_sess.currentIndexChanged.connect(self._on_session_changed)
-        self.cb_sess.currentIndexChanged.connect(lambda _i: self._persist_settings())
-        self.cb_sub.currentTextChanged.connect(lambda _t: self._persist_settings())
-        self.cb_sess.currentTextChanged.connect(lambda _t: self._persist_settings())
-        self.ed_root.textChanged.connect(self._persist_settings)
+        self.cb_sess.currentTextChanged.connect(lambda _: self._persist_settings())
+        self.ed_dest.textChanged.connect(self._persist_settings)
+
+        self._side.add_panel("\U0001f3af", "Setup", setup)
+
+        # Panel 1 – Metadata editor (default) ─────────────────────
+        meta_panel = QWidget()
+        ml = QVBoxLayout(meta_panel)
 
         self.tbl_meta = QTableWidget(0, 2)
         self.tbl_meta.setHorizontalHeaderLabels(["Key", "Value"])
         self.tbl_meta.horizontalHeader().setStretchLastSection(True)
 
         tbl_btns = QHBoxLayout()
-        b_add_row = QPushButton("Add row")
-        b_add_row.clicked.connect(self._add_meta_row)
-        tbl_btns.addWidget(b_add_row)
-        b_rm_row = QPushButton("Remove selected")
-        b_rm_row.clicked.connect(self._rm_meta_row)
-        tbl_btns.addWidget(b_rm_row)
-        b_apply = QPushButton("Apply table -> metadata")
-        b_apply.clicked.connect(self._apply_table_to_meta)
-        tbl_btns.addWidget(b_apply)
-        b_save_all = QPushButton("Save metadata (JSON/CSV/H5)")
-        b_save_all.clicked.connect(self._save_all)
-        tbl_btns.addWidget(b_save_all)
+        b_add = QPushButton("Add row"); b_add.clicked.connect(self._add_meta_row); tbl_btns.addWidget(b_add)
+        b_rm = QPushButton("Remove selected"); b_rm.clicked.connect(self._rm_meta_row); tbl_btns.addWidget(b_rm)
+        b_apply = QPushButton("Apply table \u2192 metadata"); b_apply.clicked.connect(self._apply_table_to_meta); tbl_btns.addWidget(b_apply)
+        b_save = QPushButton("Save metadata (JSON/CSV/H5)"); b_save.clicked.connect(self._save_all); tbl_btns.addWidget(b_save)
 
-        left_split = QSplitter(Qt.Vertical)
-        left_top = QWidget()
-        lt_layout = QVBoxLayout(left_top)
-        lt_layout.addWidget(self.tbl_meta, 1)
-        lt_layout.addLayout(tbl_btns)
-        left_split.addWidget(left_top)
+        meta_split = QSplitter(Qt.Vertical)
+        top_w = QWidget(); tl = QVBoxLayout(top_w)
+        tl.addWidget(self.tbl_meta, 1); tl.addLayout(tbl_btns)
+        meta_split.addWidget(top_w)
 
-        left_bottom = QWidget()
-        lb_layout = QVBoxLayout(left_bottom)
-        lb_layout.addWidget(QLabel("metadata.json (preview)"))
-        self.txt_preview = QTextEdit()
-        self.txt_preview.setReadOnly(True)
+        bot_w = QWidget(); bl = QVBoxLayout(bot_w)
+        bl.addWidget(QLabel("metadata.json (preview)"))
+        self.txt_preview = QTextEdit(); self.txt_preview.setReadOnly(True)
         mono = QFont("Consolas" if os.name == "nt" else "Monospace")
         mono.setStyleHint(QFont.Monospace)
         self.txt_preview.setFont(mono)
-        lb_layout.addWidget(self.txt_preview, 1)
-        left_split.addWidget(left_bottom)
-        left_split.setSizes([620, 280])
-        left_vbox.addWidget(left_split, 1)
+        bl.addWidget(self.txt_preview, 1)
+        meta_split.addWidget(bot_w)
+        meta_split.setSizes([620, 280])
 
-        main_split.addWidget(left_panel)
+        ml.addWidget(meta_split, 1)
 
-        # Right
-        right_panel = QWidget()
-        right_vbox = QVBoxLayout(right_panel)
+        self._side.add_panel("\U0001f4dd", "Metadata", meta_panel, default=True)
 
-        trial_top = QWidget()
-        t_layout = QVBoxLayout(trial_top)
+        # Panel 2 – Trials & comments ─────────────────────────────
+        trials_panel = QWidget()
+        trl = QVBoxLayout(trials_panel)
+
         rowt = QHBoxLayout()
         rowt.addWidget(QLabel("Trial #"))
-        self.ed_trial = QLineEdit()
-        self.ed_trial.setFixedWidth(70)
-        rowt.addWidget(self.ed_trial)
+        self.ed_trial = QLineEdit(); self.ed_trial.setFixedWidth(70); rowt.addWidget(self.ed_trial)
         rowt.addWidget(QLabel("Type"))
-        self.ed_trial_type = QLineEdit()
-        rowt.addWidget(self.ed_trial_type, 1)
-        b_add_trial = QPushButton("Add trial info")
-        b_add_trial.clicked.connect(self._add_trial_info)
-        rowt.addWidget(b_add_trial)
-        b_update = QPushButton("Update file list")
-        b_update.clicked.connect(self.update_file_list)
-        rowt.addWidget(b_update)
-        t_layout.addLayout(rowt)
+        self.ed_trial_type = QLineEdit(); rowt.addWidget(self.ed_trial_type, 1)
+        b_add_trial = QPushButton("Add trial info"); b_add_trial.clicked.connect(self._add_trial_info); rowt.addWidget(b_add_trial)
+        trl.addLayout(rowt)
 
         rowc = QHBoxLayout()
         rowc.addWidget(QLabel("Comments"))
-        self.ed_comments = QLineEdit()
-        rowc.addWidget(self.ed_comments, 1)
-        b_save_comments = QPushButton("Save comments")
-        b_save_comments.clicked.connect(self._save_comments)
-        rowc.addWidget(b_save_comments)
-        t_layout.addLayout(rowc)
+        self.ed_comments = QLineEdit(); rowc.addWidget(self.ed_comments, 1)
+        b_save_c = QPushButton("Save comments"); b_save_c.clicked.connect(self._save_comments); rowc.addWidget(b_save_c)
+        trl.addLayout(rowc)
 
-        t_layout.addWidget(QLabel("Trial info"))
+        trl.addWidget(QLabel("Trial info"))
         self.list_trials = QListWidget()
-        t_layout.addWidget(self.list_trials, 1)
+        trl.addWidget(self.list_trials, 1)
 
-        right_split = QSplitter(Qt.Vertical)
-        right_split.addWidget(trial_top)
+        self._side.add_panel("\U0001f3ac", "Trials", trials_panel)
 
-        log_widget = QWidget()
-        lw = QVBoxLayout(log_widget)
-        lw.addWidget(QLabel("Log"))
-        self.txt_log = QTextEdit()
-        self.txt_log.setReadOnly(True)
-        lw.addWidget(self.txt_log, 1)
+        # Panel 3 – Files & Log ───────────────────────────────────
+        files_panel = QWidget()
+        fl = QVBoxLayout(files_panel)
+
+        b_update = QPushButton("Update file list")
+        b_update.clicked.connect(self.update_file_list)
+        fl.addWidget(b_update)
+
+        fl.addWidget(QLabel("Log"))
+        self.txt_log = QTextEdit(); self.txt_log.setReadOnly(True)
+        fl.addWidget(self.txt_log, 1)
         self.logger = LogEmitter(self.txt_log)
-        right_split.addWidget(log_widget)
-        right_split.setSizes([300, 320])
 
-        right_vbox.addWidget(right_split, 1)
-        main_split.addWidget(right_panel)
-        main_split.setSizes([920, 360])
+        self._side.add_panel("\U0001f4c1", "Files & Log", files_panel)
 
-    def _choose_root(self):
-        d = QFileDialog.getExistingDirectory(self, "Choose data root", self.ed_root.text() or "")
-        if not d:
-            return
-        normalized = self._normalize_data_root(d)
-        self.ed_root.setText(normalized)
-        self.app_state.settings.data_root = normalized
-        self._ensure_root_dirs()
-        self._refresh_lists()
-        self._persist_settings()
+    # ── helpers ─────────────────────────────────────────────────────
 
-    def _normalize_data_root(self, path: str) -> str:
-        p = os.path.normpath(str(path or "").strip())
-        if not p:
-            return p
-        leaf = os.path.basename(p).lower()
-        if leaf in ("raw", "rawdata", "processed", "processeddata"):
-            parent = os.path.dirname(p)
-            if parent:
-                return parent
-        return p
-
-    def _effective_data_root(self) -> str:
-        root = self.app_state.settings.data_root or self.ed_root.text().strip()
-        return self._normalize_data_root(root)
-
-    def _raw_root_candidate(self) -> str:
-        return os.path.join(self._effective_data_root(), "raw")
-
-    def _prefer_data_root_as_raw(self) -> bool:
-        data_root = self._effective_data_root()
-        if not os.path.isdir(data_root):
-            return False
-        entries = [
-            d
-            for d in os.listdir(data_root)
-            if os.path.isdir(os.path.join(data_root, d))
-        ]
-        if not entries:
-            return False
-        lowered = {d.lower() for d in entries}
-        if "raw" in lowered or "processed" in lowered:
-            return False
-        return True
-
-    def _ensure_root_dirs(self):
-        os.makedirs(self._raw_root(), exist_ok=True)
-        os.makedirs(self._processed_root(), exist_ok=True)
-
-    def _raw_root(self) -> str:
-        candidate = self._raw_root_candidate()
-        if os.path.isdir(candidate):
-            return candidate
-        if self._prefer_data_root_as_raw():
-            return self._effective_data_root()
-        return candidate
-
-    def _processed_root(self) -> str:
-        data_root = self._effective_data_root()
-        candidate = os.path.join(data_root, "processed")
-        if os.path.isdir(candidate):
-            return candidate
-        leaf = os.path.basename(data_root).lower()
-        if leaf in ("processed", "processeddata"):
-            return data_root
-        return candidate
-
-    def _current_project(self) -> str:
-        return self.cb_proj.currentText().strip()
+    def _choose_destination(self):
+        d = QFileDialog.getExistingDirectory(self, "Choose destination folder",
+                                             self.ed_dest.text() or "")
+        if d:
+            self.ed_dest.setText(d)
+            self._persist_settings()
 
     def _current_experiment(self) -> str:
         return self.cb_exp.currentText().strip()
@@ -315,8 +237,7 @@ class RecordingTab(QWidget):
 
     def _session_dir(self) -> str:
         return os.path.join(
-            self._raw_root(),
-            self._current_project(),
+            self.ed_dest.text().strip(),
             self._current_experiment(),
             self._current_subject(),
             self._current_session(),
@@ -324,8 +245,7 @@ class RecordingTab(QWidget):
 
     def _set_combo_items(self, cb: QComboBox, items: List[str], keep_text: str):
         cb.blockSignals(True)
-        cb.clear()
-        cb.addItems(items)
+        cb.clear(); cb.addItems(items)
         keep = str(keep_text or "").strip()
         if keep and keep in items:
             cb.setCurrentText(keep)
@@ -339,8 +259,7 @@ class RecordingTab(QWidget):
 
     def _sanitize_entry_name(self, value: str) -> str:
         bad = '<>:"/\\|?*'
-        cleaned = "".join(ch for ch in str(value or "").strip() if ch not in bad)
-        return cleaned.strip()
+        return "".join(ch for ch in str(value or "").strip() if ch not in bad).strip()
 
     def _ensure_combo_has_value(self, cb: QComboBox, value: str):
         text = self._sanitize_entry_name(value)
@@ -348,86 +267,67 @@ class RecordingTab(QWidget):
             return
         for i in range(cb.count()):
             if cb.itemText(i).strip().lower() == text.lower():
-                cb.setCurrentIndex(i)
-                return
-        cb.addItem(text)
-        cb.setCurrentText(text)
+                cb.setCurrentIndex(i); return
+        cb.addItem(text); cb.setCurrentText(text)
 
-    def _prompt_new_subject(self):
-        project = self._current_project()
-        experiment = self._current_experiment()
-        if not project or not experiment:
-            QMessageBox.warning(self, "New subject", "Select project and experiment first.")
-            return
-        text, ok = QInputDialog.getText(self, "New subject", "Subject ID:")
-        if not ok:
-            return
-        subject = self._sanitize_entry_name(text)
-        if not subject:
-            QMessageBox.warning(self, "New subject", "Subject ID cannot be empty.")
-            return
-        self._ensure_combo_has_value(self.cb_sub, subject)
-        self._on_subject_changed()
-        self._persist_settings()
+    def _refresh_from_project(self):
+        """Populate experiments from the loaded project source, subjects/sessions from destination."""
+        proj = self.app_state.settings.get_loaded_project()
+        name = proj["name"]
+        source = proj["source_path"]
+        source_type = proj["source_type"]
+        dest = proj["destination_path"]
 
-    def _prompt_new_session(self):
-        if not self._current_subject():
-            QMessageBox.warning(self, "New session", "Select or create a subject first.")
-            return
-        text, ok = QInputDialog.getText(self, "New session", "Session ID:")
-        if not ok:
-            return
-        session = self._sanitize_entry_name(text)
-        if not session:
-            QMessageBox.warning(self, "New session", "Session ID cannot be empty.")
-            return
-        self._ensure_combo_has_value(self.cb_sess, session)
-        self._persist_settings()
-
-    def _refresh_lists(self):
-        normalized = self._effective_data_root()
-        if normalized:
-            self.app_state.settings.data_root = normalized
-        if normalized and normalized != self.ed_root.text().strip():
-            self.ed_root.blockSignals(True)
-            self.ed_root.setText(normalized)
-            self.ed_root.blockSignals(False)
-        cur_proj = self._current_project()
-        projects = list_projects(self._raw_root())
-        self._set_combo_items(self.cb_proj, projects, cur_proj)
-        self._on_project_changed()
-
-    def _on_project_changed(self, _index: int = -1):
-        proj = self._current_project()
-        exp_keep = self._current_experiment()
-        if proj:
-            exp_items = list_experiments(os.path.join(self._raw_root(), proj))
+        if name:
+            self.lbl_project.setText(f"{name} ({source_type})" if source_type else name)
         else:
-            exp_items = []
-        self._set_combo_items(self.cb_exp, exp_items, exp_keep)
+            self.lbl_project.setText("(none)")
+
+        if dest and dest != self.ed_dest.text().strip():
+            self.ed_dest.blockSignals(True)
+            self.ed_dest.setText(dest)
+            self.ed_dest.blockSignals(False)
+
+        # Experiments: union of source + destination
+        exps = set()
+        if source and os.path.isdir(source):
+            exps.update(list_experiments(source))
+        if dest and os.path.isdir(dest):
+            exps.update(list_experiments(dest))
+        self._set_combo_items(self.cb_exp, sorted(exps), self._current_experiment())
         self._on_experiment_changed()
 
     def _on_experiment_changed(self, _index: int = -1):
-        proj = self._current_project()
         exp = self._current_experiment()
-        sub_keep = self._current_subject()
-        if proj and exp:
-            sub_items = list_subjects(os.path.join(self._raw_root(), proj, exp))
-        else:
-            sub_items = []
-        self._set_combo_items(self.cb_sub, sub_items, sub_keep)
+        dest = self.ed_dest.text().strip()
+        proj = self.app_state.settings.get_loaded_project()
+        source = proj["source_path"]
+
+        subjects = set()
+        if exp and dest and os.path.isdir(os.path.join(dest, exp)):
+            subjects.update(list_subjects(os.path.join(dest, exp)))
+        if exp and source and os.path.isdir(os.path.join(source, exp)):
+            subjects.update(list_subjects(os.path.join(source, exp)))
+        self._set_combo_items(self.cb_sub, sorted(subjects), self._current_subject())
         self._on_subject_changed()
 
     def _on_subject_changed(self, _index: int = -1):
-        proj = self._current_project()
         exp = self._current_experiment()
         sub = self._current_subject()
-        sess_keep = self._current_session()
-        if proj and exp and sub:
-            sess_items = list_sessions(os.path.join(self._raw_root(), proj, exp, sub))
-        else:
-            sess_items = []
-        self._set_combo_items(self.cb_sess, sess_items, sess_keep)
+        dest = self.ed_dest.text().strip()
+        proj = self.app_state.settings.get_loaded_project()
+        source = proj["source_path"]
+
+        sessions = set()
+        if exp and sub and dest:
+            sub_dir = os.path.join(dest, exp, sub)
+            if os.path.isdir(sub_dir):
+                sessions.update(list_sessions(sub_dir))
+        if exp and sub and source:
+            src_sub_dir = os.path.join(source, exp, sub)
+            if os.path.isdir(src_sub_dir):
+                sessions.update(list_sessions(src_sub_dir))
+        self._set_combo_items(self.cb_sess, sorted(sessions), self._current_session())
         self._persist_settings()
 
     def _on_session_changed(self, _index: int):
@@ -455,29 +355,21 @@ class RecordingTab(QWidget):
         if not meta:
             sub_dir = os.path.dirname(session_dir)
             exp_dir = os.path.dirname(sub_dir)
-            proj_dir = os.path.dirname(exp_dir)
-            project = os.path.basename(proj_dir)
-            experiment = os.path.basename(exp_dir)
-            subject = os.path.basename(sub_dir)
-            session = os.path.basename(session_dir)
-            meta = SessionMetadata.new(project, subject, session, self._raw_root()).data
-            meta["Experiment"] = experiment
-            meta["Subject"] = subject
+            dest = self.ed_dest.text().strip()
+            meta = SessionMetadata.new("", os.path.basename(sub_dir),
+                                       os.path.basename(session_dir), dest).data
+            meta["Experiment"] = os.path.basename(exp_dir)
+            meta["Subject"] = os.path.basename(sub_dir)
 
         self.meta = meta
         subject = str(meta.get("Subject", "") or meta.get("Animal", ""))
         self._loading_session = True
-        if self.cb_proj.count() == 0:
-            self._refresh_lists()
-
         try:
-            self.cb_proj.setCurrentText(str(meta.get("Project", "")))
-            self._on_project_changed()
-            self.cb_exp.setCurrentText(str(meta.get("Experiment", "")))
+            self._ensure_combo_has_value(self.cb_exp, str(meta.get("Experiment", "")))
             self._on_experiment_changed()
-            self.cb_sub.setCurrentText(subject)
+            self._ensure_combo_has_value(self.cb_sub, subject)
             self._on_subject_changed()
-            self.cb_sess.setCurrentText(str(meta.get("Session", "")))
+            self._ensure_combo_has_value(self.cb_sess, str(meta.get("Session", "")))
         finally:
             self._loading_session = False
 
@@ -486,8 +378,9 @@ class RecordingTab(QWidget):
         for k, v in (meta.get("trial_info") or {}).items():
             self.list_trials.addItem(f"Trial {k}: {v}")
 
+        proj = self.app_state.settings.get_loaded_project()
         self.app_state.set_current(
-            project=str(meta.get("Project", "")),
+            project=proj["name"],
             experiment=str(meta.get("Experiment", "")),
             animal=subject,
             session=str(meta.get("Session", "")),
@@ -498,82 +391,60 @@ class RecordingTab(QWidget):
         self._persist_settings()
 
     def new_recording(self):
-        self._ensure_root_dirs()
-        project = self._current_project()
+        dest = self.ed_dest.text().strip()
         experiment = self._current_experiment()
         subject = self._current_subject()
         session = self._current_session()
-        if not (project and experiment and subject and session):
-            QMessageBox.warning(self, "Missing fields", "Fill Project, Experiment, Subject, Session.")
-            return
+        proj = self.app_state.settings.get_loaded_project()
+        project_name = proj["name"]
 
-        project_dir = os.path.join(self._raw_root(), project)
-        experiment_dir = os.path.join(project_dir, experiment)
-        subject_dir = os.path.join(experiment_dir, subject)
-        session_dir = os.path.join(subject_dir, session)
-        for d in (project_dir, experiment_dir, subject_dir, session_dir):
-            os.makedirs(d, exist_ok=True)
+        if not dest:
+            QMessageBox.warning(self, "Missing", "Set a Destination path."); return
+        if not all([experiment, subject, session]):
+            QMessageBox.warning(self, "Missing fields", "Fill Experiment, Subject, and Session."); return
 
-        meta = self._new_recording_metadata(project, experiment, subject, session)
+        session_dir = os.path.join(dest, experiment, subject, session)
+        os.makedirs(session_dir, exist_ok=True)
+
+        meta = self._new_recording_metadata(project_name, experiment, subject, session)
         self.meta = meta
         save_session_triplet(session_dir, self.meta, logger=self.logger.log)
         self.load_session(session_dir)
+        self._refresh_from_project()  # update combos
         self._persist_settings()
 
-    def _new_recording_metadata(self, project: str, experiment: str, subject: str, session: str) -> Dict[str, Any]:
-        # Keep schema keys, but start non-identifying fields empty for new recordings.
-        meta = SessionMetadata.new(project, subject, session, self._raw_root()).data
-        keep_keys = {
-            "DateTime",
-            "Project",
-            "Experiment",
-            "Animal",
-            "Subject",
-            "Session",
-            "RootDir",
-            "SessionUUID",
-            "file_list",
-            "trial_info",
-            "trial_assets",
-            "preprocessing",
-        }
+    def _new_recording_metadata(self, project, experiment, subject, session):
+        dest = self.ed_dest.text().strip()
+        meta = SessionMetadata.new(project, subject, session, dest).data
+        keep_keys = {"DateTime", "Project", "Experiment", "Animal", "Subject", "Session",
+                     "RootDir", "SessionUUID", "file_list", "trial_info", "trial_assets", "preprocessing"}
         for k in list(meta.keys()):
             if k in keep_keys:
                 continue
             v = meta.get(k)
-            if isinstance(v, list):
-                meta[k] = []
-            elif isinstance(v, dict):
-                meta[k] = {}
-            else:
-                meta[k] = ""
-        meta["Project"] = project
-        meta["Experiment"] = experiment
-        meta["Animal"] = subject
-        meta["Subject"] = subject
-        meta["Session"] = str(session)
-        meta["DateTime"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        meta["file_list"] = []
-        meta["trial_info"] = {}
-        meta["trial_assets"] = {}
-        meta["preprocessing"] = []
+            if isinstance(v, list): meta[k] = []
+            elif isinstance(v, dict): meta[k] = {}
+            else: meta[k] = ""
+        meta.update({
+            "Project": project, "Experiment": experiment,
+            "Animal": subject, "Subject": subject,
+            "Session": str(session), "RootDir": dest,
+            "DateTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "file_list": [], "trial_info": {}, "trial_assets": {}, "preprocessing": [],
+        })
         return meta
 
     def update_file_list(self):
         session_dir = self._session_dir()
         if not os.path.isdir(session_dir):
-            QMessageBox.critical(self, "Not found", f"Session directory not found:\n{session_dir}")
-            return
-
+            QMessageBox.critical(self, "Not found", f"Session directory not found:\n{session_dir}"); return
         def work():
             file_list = scan_file_list(session_dir)
             self.meta["file_list"] = file_list
             save_session_triplet(session_dir, self.meta, logger=self.logger.log)
-
             srv_root = self.app_state.settings.get_server_root_for_project(self.meta.get("Project", ""))
             if srv_root and os.path.isdir(srv_root):
-                proj = self.meta.get("Project", "")
-                exp = self.meta.get("Experiment", "")
+                proj = self.meta.get("Project", ""); exp = self.meta.get("Experiment", "")
                 subject = self.meta.get("Subject", "") or self.meta.get("Animal", "")
                 session = self.meta.get("Session", "")
                 server_proj = os.path.join(srv_root, proj)
@@ -582,18 +453,15 @@ class RecordingTab(QWidget):
                     item["server_path"] = spath if os.path.exists(spath) else ""
                 save_session_triplet(session_dir, self.meta, logger=self.logger.log)
                 self.logger.log("Server presence annotated in metadata.")
-
             self._refresh_preview()
             self.logger.log("File list updated.")
-
         run_in_thread(work)
 
     def _add_trial_info(self):
         t = self.ed_trial.text().strip()
         tt = self.ed_trial_type.text().strip()
         if not t:
-            QMessageBox.warning(self, "Trial", "Enter trial number.")
-            return
+            QMessageBox.warning(self, "Trial", "Enter trial number."); return
         self.meta.setdefault("trial_info", {})[str(int(t))] = tt
         self.list_trials.addItem(f"Trial {t}: {tt}")
         save_session_triplet(self._session_dir(), self.meta, logger=self.logger.log)
@@ -609,14 +477,11 @@ class RecordingTab(QWidget):
         self._refresh_preview()
 
     def _add_meta_row(self):
-        r = self.tbl_meta.rowCount()
-        self.tbl_meta.insertRow(r)
-        self.tbl_meta.setItem(r, 0, QTableWidgetItem(""))
-        self.tbl_meta.setItem(r, 1, QTableWidgetItem(""))
+        r = self.tbl_meta.rowCount(); self.tbl_meta.insertRow(r)
+        self.tbl_meta.setItem(r, 0, QTableWidgetItem("")); self.tbl_meta.setItem(r, 1, QTableWidgetItem(""))
 
     def _rm_meta_row(self):
-        rows = sorted({i.row() for i in self.tbl_meta.selectedIndexes()}, reverse=True)
-        for r in rows:
+        for r in sorted({i.row() for i in self.tbl_meta.selectedIndexes()}, reverse=True):
             self.tbl_meta.removeRow(r)
 
     def _apply_table_to_meta(self):
@@ -624,18 +489,11 @@ class RecordingTab(QWidget):
         new_meta: Dict[str, Any] = {}
         for k, v in flat.items():
             try:
-                new_meta[k] = json.loads(v)
-                continue
-            except Exception:
-                pass
+                new_meta[k] = json.loads(v); continue
+            except Exception: pass
             try:
-                if "." in v:
-                    new_meta[k] = float(v)
-                else:
-                    new_meta[k] = int(v)
-                continue
-            except Exception:
-                pass
+                new_meta[k] = float(v) if "." in v else int(v); continue
+            except Exception: pass
             new_meta[k] = v
         self.meta = new_meta
         save_session_triplet(self._session_dir(), self.meta, logger=self.logger.log)
@@ -643,30 +501,20 @@ class RecordingTab(QWidget):
 
     def _load_settings(self):
         data = self.app_state.settings.get_recording_tab_settings()
-        root = self._normalize_data_root(self.app_state.settings.data_root)
-        if root:
-            self.ed_root.setText(root)
-        proj = str(data.get("project", "")).strip()
-        exp = str(data.get("experiment", "")).strip()
-        sub = str(data.get("subject", "")).strip()
-        sess = str(data.get("session", "")).strip()
-        if proj:
-            self.cb_proj.setCurrentText(proj)
-        if exp:
-            self.cb_exp.setCurrentText(exp)
-        if sub:
-            self.cb_sub.setCurrentText(sub)
-        if sess:
-            self.cb_sess.setCurrentText(sess)
+        proj = self.app_state.settings.get_loaded_project()
+        dest = data.get("destination_path") or proj.get("destination_path", "")
+        if dest:
+            self.ed_dest.setText(dest)
+        for attr, key in [("cb_exp", "experiment"), ("cb_sub", "subject"), ("cb_sess", "session")]:
+            val = str(data.get(key, "")).strip()
+            if val:
+                getattr(self, attr).setCurrentText(val)
 
     def _persist_settings(self):
-        root = self._normalize_data_root(self.app_state.settings.data_root)
-        data = {
-            "data_root": root,
-            "project": self._current_project(),
+        self.app_state.settings.put_recording_tab_settings({
+            "destination_path": self.ed_dest.text().strip(),
             "experiment": self._current_experiment(),
             "subject": self._current_subject(),
             "session": self._current_session(),
             "last_session_path": self.app_state.current_session_path or self._session_dir(),
-        }
-        self.app_state.settings.put_recording_tab_settings(data)
+        })

@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..io_ops import list_projects
+from ..side_panel import SidePanelLayout
 from ..state import AppState
 from ..utils import run_in_thread
 from ..services.data_reorganizer import (
@@ -95,88 +96,156 @@ class DataReorganizerTab(QWidget):
         self.emitter.error.connect(self._on_error)
         self.emitter.busy.connect(self._set_busy)
 
+    # ------------------------------------------------------------------
+    # UI build
+    # ------------------------------------------------------------------
     def _build_ui(self):
         root = QVBoxLayout(self)
-        main_split = QSplitter(Qt.Horizontal)
-        main_split.setChildrenCollapsible(False)
-        root.addWidget(main_split, 1)
+        root.setContentsMargins(0, 0, 0, 0)
+        self._side = SidePanelLayout()
+        root.addWidget(self._side, 1)
 
-        # Column 1 (scroll): setup + plan import
-        col1_widget = QWidget()
-        col1_layout = QVBoxLayout(col1_widget)
-        col1_layout.setContentsMargins(0, 0, 0, 0)
-        col1_layout.setSpacing(8)
+        # Panel 0 – Setup (Step A + B)
+        self._side.add_panel("\U0001f527", "Setup", self._build_setup_panel())
 
-        # Step A
-        self.grp_a = QGroupBox("Step A - Project and experiment setup")
+        # Panel 1 – Columns (Step C)
+        self._side.add_panel("\U0001f3f7\ufe0f", "Columns", self._build_columns_panel())
+
+        # Panel 2 – Match (Step D) – default
+        self._side.add_panel("\U0001f50d", "Match", self._build_match_panel(), default=True)
+
+        # Panel 3 – Run (Step E + log)
+        self._side.add_panel("\u25b6\ufe0f", "Run", self._build_run_panel())
+
+        # Table readability
+        all_tables = [
+            self.tbl_plan_preview,
+            self.lst_extra_cols,
+            self.lst_custom_match_cols,
+            self.tbl_dtype_map,
+            self.tbl_match_plan,
+            self.tbl_unmatched,
+        ]
+        for tbl in all_tables:
+            tbl.setAlternatingRowColors(True)
+            tbl.verticalHeader().setVisible(False)
+            tbl.setWordWrap(False)
+            tbl.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+            tbl.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+            tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.lst_extra_cols.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.lst_extra_cols.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+
+        # Keyboard shortcuts
+        self.btn_scan.setShortcut("Ctrl+Shift+S")
+        self.btn_build_match_plan.setShortcut("Ctrl+Shift+M")
+        self.btn_execute.setShortcut("Ctrl+Return")
+        self.btn_cancel.setShortcut("Esc")
+
+        # Connections – browse buttons (setup)
+        self._b_sr.clicked.connect(lambda: self._pick_dir(self.ed_source_raw, append=True))
+        self._b_sp.clicked.connect(lambda: self._pick_dir(self.ed_source_proc, append=True))
+        self._b_tr.clicked.connect(lambda: self._pick_dir(self.ed_target_raw))
+        self._b_tp.clicked.connect(lambda: self._pick_dir(self.ed_target_proc))
+
+        self.cb_project_mode.currentIndexChanged.connect(self._update_project_mode_ui)
+        self.btn_refresh_projects.clicked.connect(self._refresh_project_list)
+        self.btn_resolve_paths.clicked.connect(self._validate_and_prepare_targets)
+        self.btn_browse_plan.clicked.connect(self._choose_plan_file)
+        self.btn_load_plan.clicked.connect(self._load_plan)
+        self.btn_apply_columns.clicked.connect(self._apply_column_assignment)
+        self.btn_scan.clicked.connect(self._scan_sources)
+        self.btn_build_match_plan.clicked.connect(self._build_match_plan)
+        self.btn_apply_filter.clicked.connect(self._apply_plan_filter)
+        self.btn_execute.clicked.connect(self._execute)
+        self.btn_update_metadata.clicked.connect(self._update_metadata_only)
+        self.btn_cancel.clicked.connect(self._request_cancel)
+        self.btn_save_config.clicked.connect(self._save_config_file)
+        self.btn_load_config.clicked.connect(self._load_config_file)
+        self.btn_export_report.clicked.connect(self._export_match_report)
+
+        self.ed_new_project.textChanged.connect(self._update_resolved_paths)
+        self.ed_experiment.textChanged.connect(self._update_resolved_paths)
+        self.cb_existing_project.currentTextChanged.connect(self._update_resolved_paths)
+        self.ed_target_raw.textChanged.connect(self._update_resolved_paths)
+        self.ed_target_proc.textChanged.connect(self._update_resolved_paths)
+
+        self._refresh_project_list()
+        self._update_project_mode_ui()
+        self._update_resolved_paths()
+        self._apply_tooltips()
+        self._set_busy(False)
+
+    # ---- Panel builders ------------------------------------------------
+
+    def _build_setup_panel(self) -> QWidget:
+        """Step A (project/experiment) + Step B (plan import)."""
+        outer = QWidget()
+        outer_l = QVBoxLayout(outer)
+        outer_l.setContentsMargins(4, 4, 4, 4)
+        outer_l.setSpacing(8)
+
+        scroll_w = QWidget()
+        scroll_l = QVBoxLayout(scroll_w)
+        scroll_l.setContentsMargins(0, 0, 0, 0)
+        scroll_l.setSpacing(8)
+
+        # Step A ----------------------------------------------------------
+        self.grp_a = QGroupBox("Step A \u2013 Project and experiment setup")
         ga = QGridLayout(self.grp_a)
         row = 0
+
         ga.addWidget(QLabel("Project mode"), row, 0)
         self.cb_project_mode = QComboBox()
         self.cb_project_mode.addItems(["Use existing project", "Create new project"])
-        ga.addWidget(self.cb_project_mode, row, 1)
-        row += 1
+        ga.addWidget(self.cb_project_mode, row, 1); row += 1
 
         ga.addWidget(QLabel("Existing project"), row, 0)
         self.cb_existing_project = QComboBox()
-        ga.addWidget(self.cb_existing_project, row, 1)
-        row += 1
+        ga.addWidget(self.cb_existing_project, row, 1); row += 1
 
         ga.addWidget(QLabel("New project name"), row, 0)
         self.ed_new_project = QLineEdit()
-        ga.addWidget(self.ed_new_project, row, 1)
-        row += 1
+        ga.addWidget(self.ed_new_project, row, 1); row += 1
 
         ga.addWidget(QLabel("Experiment name"), row, 0)
         self.ed_experiment = QLineEdit()
-        ga.addWidget(self.ed_experiment, row, 1)
-        row += 1
+        ga.addWidget(self.ed_experiment, row, 1); row += 1
 
-        self.ed_source_raw, b_sr = self._path_row("Source raw folder(s)", ga, row)
-        row += 1
-        self.ed_source_proc, b_sp = self._path_row("Source processed folder(s)", ga, row)
-        row += 1
-        self.ed_target_raw, b_tr = self._path_row("Target raw root", ga, row)
-        row += 1
-        self.ed_target_proc, b_tp = self._path_row("Target processed root", ga, row)
-        row += 1
+        self.ed_source_raw, self._b_sr = self._path_row("Source raw folder(s)", ga, row); row += 1
+        self.ed_source_proc, self._b_sp = self._path_row("Source processed folder(s)", ga, row); row += 1
+        self.ed_target_raw, self._b_tr = self._path_row("Target raw root", ga, row); row += 1
+        self.ed_target_proc, self._b_tp = self._path_row("Target processed root", ga, row); row += 1
 
         ga.addWidget(QLabel("Resolved raw experiment path"), row, 0)
         self.lbl_resolved_raw = QLabel("-")
         self.lbl_resolved_raw.setWordWrap(True)
         self.lbl_resolved_raw.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        ga.addWidget(self.lbl_resolved_raw, row, 1)
-        row += 1
+        ga.addWidget(self.lbl_resolved_raw, row, 1); row += 1
 
         ga.addWidget(QLabel("Resolved processed experiment path"), row, 0)
         self.lbl_resolved_proc = QLabel("-")
         self.lbl_resolved_proc.setWordWrap(True)
         self.lbl_resolved_proc.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        ga.addWidget(self.lbl_resolved_proc, row, 1)
-        row += 1
+        ga.addWidget(self.lbl_resolved_proc, row, 1); row += 1
 
         self.chk_preserve_group = QCheckBox("Preserve processed group hierarchy")
-        ga.addWidget(self.chk_preserve_group, row, 0, 1, 2)
-        row += 1
+        ga.addWidget(self.chk_preserve_group, row, 0, 1, 2); row += 1
 
         ga.addWidget(QLabel("If destination exists"), row, 0)
         self.cb_overwrite = QComboBox()
         self.cb_overwrite.addItems(["skip", "rename", "overwrite"])
-        ga.addWidget(self.cb_overwrite, row, 1)
-        row += 1
+        ga.addWidget(self.cb_overwrite, row, 1); row += 1
 
         self.chk_overwrite_confirm = QCheckBox("I confirm overwrite when strategy is overwrite")
-        ga.addWidget(self.chk_overwrite_confirm, row, 0, 1, 2)
-        row += 1
+        ga.addWidget(self.chk_overwrite_confirm, row, 0, 1, 2); row += 1
 
         self.chk_dry_run = QCheckBox("Dry run (do not copy files)")
         self.chk_dry_run.setChecked(True)
-        ga.addWidget(self.chk_dry_run, row, 0, 1, 2)
-        row += 1
+        ga.addWidget(self.chk_dry_run, row, 0, 1, 2); row += 1
 
         self.chk_verify_size = QCheckBox("Verify file sizes after copy")
-        ga.addWidget(self.chk_verify_size, row, 0, 1, 2)
-        row += 1
+        ga.addWidget(self.chk_verify_size, row, 0, 1, 2); row += 1
 
         btn_row = QHBoxLayout()
         self.btn_refresh_projects = QPushButton("Refresh projects")
@@ -185,10 +254,10 @@ class DataReorganizerTab(QWidget):
         btn_row.addWidget(self.btn_resolve_paths)
         btn_row.addStretch(1)
         ga.addLayout(btn_row, row, 0, 1, 2)
-        col1_layout.addWidget(self.grp_a)
+        scroll_l.addWidget(self.grp_a)
 
-        # Step B
-        self.grp_b = QGroupBox("Step B - Metadata plan import")
+        # Step B ----------------------------------------------------------
+        self.grp_b = QGroupBox("Step B \u2013 Metadata plan import")
         gb = QVBoxLayout(self.grp_b)
         fb = QHBoxLayout()
         self.ed_plan_path = QLineEdit()
@@ -210,21 +279,23 @@ class DataReorganizerTab(QWidget):
         self.tbl_plan_preview = QTableWidget(0, 0)
         self.tbl_plan_preview.setMinimumHeight(220)
         gb.addWidget(self.tbl_plan_preview, 1)
-        col1_layout.addWidget(self.grp_b)
-        col1_layout.addStretch(1)
+        scroll_l.addWidget(self.grp_b)
+        scroll_l.addStretch(1)
 
-        col1_scroll = QScrollArea()
-        col1_scroll.setWidgetResizable(True)
-        col1_scroll.setWidget(col1_widget)
-        main_split.addWidget(col1_scroll)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(scroll_w)
+        outer_l.addWidget(scroll, 1)
+        return outer
 
-        # Column 2 (scroll): column assignment
-        col2_widget = QWidget()
-        col2_layout = QVBoxLayout(col2_widget)
-        col2_layout.setContentsMargins(0, 0, 0, 0)
-        col2_layout.setSpacing(8)
+    def _build_columns_panel(self) -> QWidget:
+        """Step C – column assignment."""
+        outer = QWidget()
+        outer_l = QVBoxLayout(outer)
+        outer_l.setContentsMargins(4, 4, 4, 4)
+        outer_l.setSpacing(8)
 
-        self.grp_c = QGroupBox("Step C - Column assignment")
+        self.grp_c = QGroupBox("Step C \u2013 Column assignment")
         gc = QVBoxLayout(self.grp_c)
 
         self.cb_subject = QComboBox()
@@ -233,14 +304,12 @@ class DataReorganizerTab(QWidget):
         self.cb_genotype = QComboBox()
         self.cb_condition = QComboBox()
         self.cb_match_mode = QComboBox()
-        self.cb_match_mode.addItems(
-            [
-                "Use only subject_id for matching",
-                "Use only trial_id for matching",
-                "Use subject_id + session_id",
-                "Use custom columns",
-            ]
-        )
+        self.cb_match_mode.addItems([
+            "Use only subject_id for matching",
+            "Use only trial_id for matching",
+            "Use subject_id + session_id",
+            "Use custom columns",
+        ])
         self.chk_case_sensitive = QCheckBox("Case sensitive matching")
         self.btn_apply_columns = QPushButton("Apply column assignment")
 
@@ -254,7 +323,7 @@ class DataReorganizerTab(QWidget):
         gc.addLayout(form)
         gc.addWidget(self.chk_case_sensitive)
 
-        self.lst_extra_cols = QTableWidget(0, 1)
+        self.lst_extra_cols = QTableWidget(0, 2)
         _table_set_headers(self.lst_extra_cols, ["Include", "Additional metadata column"])
         self.lst_extra_cols.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.lst_extra_cols.setSelectionMode(QAbstractItemView.NoSelection)
@@ -295,27 +364,20 @@ class DataReorganizerTab(QWidget):
         c_split.setSizes([280, 280, 360])
         gc.addWidget(c_split, 1)
         gc.addWidget(self.btn_apply_columns)
-        col2_layout.addWidget(self.grp_c)
-        col2_layout.addStretch(1)
 
-        col2_scroll = QScrollArea()
-        col2_scroll.setWidgetResizable(True)
-        col2_scroll.setWidget(col2_widget)
-        main_split.addWidget(col2_scroll)
+        outer_l.addWidget(self.grp_c, 1)
+        return outer
 
-        # Column 3: scan/match + execution/log
-        col3 = QWidget()
-        col3_l = QVBoxLayout(col3)
-        col3_l.setContentsMargins(0, 0, 0, 0)
-        col3_l.setSpacing(8)
+    def _build_match_panel(self) -> QWidget:
+        """Step D – file discovery & matching."""
+        outer = QWidget()
+        outer_l = QVBoxLayout(outer)
+        outer_l.setContentsMargins(4, 4, 4, 4)
+        outer_l.setSpacing(8)
 
-        right_split = QSplitter(Qt.Vertical)
-        right_split.setChildrenCollapsible(False)
-        col3_l.addWidget(right_split, 1)
-
-        # Step D
-        self.grp_d = QGroupBox("Step D - File discovery and matching")
+        self.grp_d = QGroupBox("Step D \u2013 File discovery and matching")
         gd = QVBoxLayout(self.grp_d)
+
         d_top = QHBoxLayout()
         self.btn_scan = QPushButton("Scan source folders")
         self.btn_build_match_plan = QPushButton("Build match plan")
@@ -355,10 +417,10 @@ class DataReorganizerTab(QWidget):
         match_l = QVBoxLayout(match_w)
         match_l.setContentsMargins(0, 0, 0, 0)
         self.tbl_match_plan = QTableWidget(0, 7)
-        _table_set_headers(
-            self.tbl_match_plan,
-            ["row", "subject_id", "session_id", "match_key", "matched raw", "matched processed", "warnings"],
-        )
+        _table_set_headers(self.tbl_match_plan, [
+            "row", "subject_id", "session_id", "match_key",
+            "matched raw", "matched processed", "warnings",
+        ])
         self.tbl_match_plan.setMinimumHeight(220)
         match_l.addWidget(self.tbl_match_plan, 1)
         d_tables_split.addWidget(match_w)
@@ -374,15 +436,19 @@ class DataReorganizerTab(QWidget):
         d_tables_split.setSizes([320, 180])
 
         gd.addWidget(d_tables_split, 3)
-        right_split.addWidget(self.grp_d)
+        outer_l.addWidget(self.grp_d, 1)
+        return outer
 
-        # Step E + logs
-        bottom = QWidget()
-        bl = QVBoxLayout(bottom)
-        bl.setContentsMargins(0, 0, 0, 0)
+    def _build_run_panel(self) -> QWidget:
+        """Step E – execution + log."""
+        outer = QWidget()
+        outer_l = QVBoxLayout(outer)
+        outer_l.setContentsMargins(4, 4, 4, 4)
+        outer_l.setSpacing(8)
 
-        self.grp_e = QGroupBox("Step E - Preview and execution")
+        self.grp_e = QGroupBox("Step E \u2013 Preview and execution")
         ge = QVBoxLayout(self.grp_e)
+
         e_btn = QHBoxLayout()
         self.btn_execute = QPushButton("Execute copy")
         self.btn_update_metadata = QPushButton("Update metadata")
@@ -409,79 +475,17 @@ class DataReorganizerTab(QWidget):
 
         self.lbl_summary = QLabel("Summary: -")
         ge.addWidget(self.lbl_summary)
-        bl.addWidget(self.grp_e)
+        outer_l.addWidget(self.grp_e)
 
         self.txt_log = QTextEdit()
         self.txt_log.setReadOnly(True)
         self.txt_log.setMinimumHeight(160)
-        bl.addWidget(self.txt_log, 1)
+        outer_l.addWidget(self.txt_log, 1)
+        return outer
 
-        right_split.addWidget(bottom)
-        right_split.setSizes([700, 260])
-        main_split.addWidget(col3)
-        main_split.setSizes([640, 560, 920])
-        main_split.setStretchFactor(0, 2)
-        main_split.setStretchFactor(1, 2)
-        main_split.setStretchFactor(2, 3)
-
-        # Table readability/accessibility improvements.
-        all_tables = [
-            self.tbl_plan_preview,
-            self.lst_extra_cols,
-            self.lst_custom_match_cols,
-            self.tbl_dtype_map,
-            self.tbl_match_plan,
-            self.tbl_unmatched,
-        ]
-        for tbl in all_tables:
-            tbl.setAlternatingRowColors(True)
-            tbl.verticalHeader().setVisible(False)
-            tbl.setWordWrap(False)
-            tbl.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
-            tbl.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
-            tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.lst_extra_cols.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.lst_extra_cols.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-
-        # Keyboard shortcuts.
-        self.btn_scan.setShortcut("Ctrl+Shift+S")
-        self.btn_build_match_plan.setShortcut("Ctrl+Shift+M")
-        self.btn_execute.setShortcut("Ctrl+Return")
-        self.btn_cancel.setShortcut("Esc")
-
-        b_sr.clicked.connect(lambda: self._pick_dir(self.ed_source_raw, append=True))
-        b_sp.clicked.connect(lambda: self._pick_dir(self.ed_source_proc, append=True))
-        b_tr.clicked.connect(lambda: self._pick_dir(self.ed_target_raw))
-        b_tp.clicked.connect(lambda: self._pick_dir(self.ed_target_proc))
-
-        self.cb_project_mode.currentIndexChanged.connect(self._update_project_mode_ui)
-        self.btn_refresh_projects.clicked.connect(self._refresh_project_list)
-        self.btn_resolve_paths.clicked.connect(self._validate_and_prepare_targets)
-        self.btn_browse_plan.clicked.connect(self._choose_plan_file)
-        self.btn_load_plan.clicked.connect(self._load_plan)
-        self.btn_apply_columns.clicked.connect(self._apply_column_assignment)
-        self.btn_scan.clicked.connect(self._scan_sources)
-        self.btn_build_match_plan.clicked.connect(self._build_match_plan)
-        self.btn_apply_filter.clicked.connect(self._apply_plan_filter)
-        self.btn_execute.clicked.connect(self._execute)
-        self.btn_update_metadata.clicked.connect(self._update_metadata_only)
-        self.btn_cancel.clicked.connect(self._request_cancel)
-        self.btn_save_config.clicked.connect(self._save_config_file)
-        self.btn_load_config.clicked.connect(self._load_config_file)
-        self.btn_export_report.clicked.connect(self._export_match_report)
-
-        self.ed_new_project.textChanged.connect(self._update_resolved_paths)
-        self.ed_experiment.textChanged.connect(self._update_resolved_paths)
-        self.cb_existing_project.currentTextChanged.connect(self._update_resolved_paths)
-        self.ed_target_raw.textChanged.connect(self._update_resolved_paths)
-        self.ed_target_proc.textChanged.connect(self._update_resolved_paths)
-
-        self._refresh_project_list()
-        self._update_project_mode_ui()
-        self._update_resolved_paths()
-        self._apply_tooltips()
-        self._set_busy(False)
-
+    # ------------------------------------------------------------------
+    # Helper used during build
+    # ------------------------------------------------------------------
     def _path_row(self, label: str, layout: QGridLayout, row: int):
         layout.addWidget(QLabel(label), row, 0)
         ed = QLineEdit()
@@ -494,6 +498,9 @@ class DataReorganizerTab(QWidget):
         layout.addWidget(row_w, row, 1)
         return ed, b
 
+    # ------------------------------------------------------------------
+    # Logging / progress / busy
+    # ------------------------------------------------------------------
     def _append_log(self, message: str):
         ts = datetime.now().strftime("%H:%M:%S")
         self.txt_log.append(f"[{ts}] {message}")
@@ -536,6 +543,9 @@ class DataReorganizerTab(QWidget):
         self.btn_save_config.setToolTip("Save Data reorganizer configuration (paths, assignments, options) to JSON.")
         self.btn_load_config.setToolTip("Load a saved Data reorganizer configuration from JSON.")
 
+    # ------------------------------------------------------------------
+    # Path helpers
+    # ------------------------------------------------------------------
     def _split_paths(self, text: str) -> List[str]:
         out: List[str] = []
         seen = set()
@@ -584,6 +594,9 @@ class DataReorganizerTab(QWidget):
             self.ed_plan_path.setText(path)
             self._persist_settings()
 
+    # ------------------------------------------------------------------
+    # Project / experiment helpers
+    # ------------------------------------------------------------------
     def _refresh_project_list(self):
         current = self.cb_existing_project.currentText()
         projects = list_projects(self.app_state.settings.raw_root)
@@ -653,6 +666,9 @@ class DataReorganizerTab(QWidget):
         self._update_resolved_paths()
         self._persist_settings()
 
+    # ------------------------------------------------------------------
+    # Column assignment helpers
+    # ------------------------------------------------------------------
     def _populate_columns_ui(self, columns: List[str]):
         opts = ["(none)"] + list(columns)
         for cb in (self.cb_subject, self.cb_session, self.cb_trial, self.cb_genotype, self.cb_condition):
@@ -768,6 +784,9 @@ class DataReorganizerTab(QWidget):
             case_sensitive=self.chk_case_sensitive.isChecked(),
         )
 
+    # ------------------------------------------------------------------
+    # Plan load / preview
+    # ------------------------------------------------------------------
     def _load_plan(self):
         path = self.ed_plan_path.text().strip()
         if not path:
@@ -817,6 +836,9 @@ class DataReorganizerTab(QWidget):
         self._append_log(f"Column assignment applied to {len(self.plan_rows)} rows.")
         self._persist_settings()
 
+    # ------------------------------------------------------------------
+    # Scan / match
+    # ------------------------------------------------------------------
     def _scan_sources(self):
         if self.plan_rows is None or len(self.plan_rows) == 0:
             QMessageBox.warning(self, "Scan", "Load plan and apply column assignment first.")
@@ -919,6 +941,9 @@ class DataReorganizerTab(QWidget):
             if item and item.text().strip() in chosen:
                 item.setSelected(True)
 
+    # ------------------------------------------------------------------
+    # Config save / load
+    # ------------------------------------------------------------------
     def _collect_exportable_config(self) -> Dict[str, Any]:
         raw_dirs = self._split_paths(self.ed_source_raw.text())
         proc_dirs = self._split_paths(self.ed_source_proc.text())
@@ -1066,6 +1091,9 @@ class DataReorganizerTab(QWidget):
         self._append_log(f"Loaded config: {path}")
         self._persist_settings()
 
+    # ------------------------------------------------------------------
+    # Match plan
+    # ------------------------------------------------------------------
     def _build_match_plan(self):
         if not self.plan_rows:
             QMessageBox.warning(self, "Match plan", "Load plan and apply column assignment first.")
@@ -1160,6 +1188,9 @@ class DataReorganizerTab(QWidget):
             rows = [rr for rr in self.match_plan.row_results if len(rr.conflict_file_ids) > 0]
         self._populate_match_table(rows)
 
+    # ------------------------------------------------------------------
+    # Execute
+    # ------------------------------------------------------------------
     def _build_config(self) -> ReorganizerConfig:
         assignment = self._build_assignment()
         raw_dirs = self._split_paths(self.ed_source_raw.text())
@@ -1266,7 +1297,6 @@ class DataReorganizerTab(QWidget):
             return
         config.dry_run = False
 
-        # Re-apply the current column assignment so newly checked metadata columns are included.
         try:
             assignment = self._build_assignment()
             if self.plan_load_result is None:
@@ -1370,6 +1400,9 @@ class DataReorganizerTab(QWidget):
         writer._write_dict_rows_csv(rows, path)
         self._append_log(f"Exported match report: {path}")
 
+    # ------------------------------------------------------------------
+    # Preferences persistence
+    # ------------------------------------------------------------------
     def _load_prefs(self):
         data = self.app_state.settings.get_data_reorganizer_settings()
         raw_dirs = data.get("source_raw_dirs", data.get("source_raw_dir", ""))

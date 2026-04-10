@@ -78,6 +78,16 @@ python run_app.py
 - Optional experiment-level backup selection
 - Last-used backup roots and schedules persisted
 
+### Staging tab (linked recordings)
+- Record new sessions **locally** without downloading server projects
+- Browse server root to pick target project, experiment, and subject
+- Create linked recordings in a local staging area (`data_root/staging/`)
+- Each recording carries metadata tagging its server destination
+- **Sync all pending** or selected recordings to the server with one click
+- Staged recordings are also auto-synced during scheduled backups
+- Status tracking: Pending → Synced / Error with re-queue support
+- Open local staging folder or individual recording folders directly
+
 ---
 
 ## Data Reorganizer Outputs
@@ -117,10 +127,12 @@ MetaMan/
     recording_tab.py
     preprocessing_tab.py
     data_reorganizer_tab.py
+    staging_tab.py
   services/
     data_reorganizer.py
     file_scanner.py
     server_sync.py
+    staging_service.py
     search_service.py
 ```
 

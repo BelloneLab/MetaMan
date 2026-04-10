@@ -1,4 +1,5 @@
 import os
+import sys
 from datetime import datetime
 from time import time
 
@@ -18,21 +19,36 @@ from .tabs.navigation_tab import NavigationTab
 from .tabs.recording_tab import RecordingTab
 from .tabs.preprocessing_tab import PreprocessingTab
 from .tabs.data_reorganizer_tab import DataReorganizerTab
+from .tabs.staging_tab import StagingTab
 from .services.server_sync import sync_project_to_server
+from .services.staging_service import load_manifest, sync_pending
+from .side_panel import SidePanelLayout
 from .services.search_service import search_in_project
 from .io_ops import list_experiments, list_projects, load_session_metadata, save_session_triplet
 from .utils import run_in_thread
+from .structure_designer import StructureDesignerDialog
+from .services.structure_schema import default_structure_schema, normalize_structure_schema
 
 
 def _resolve_logo_path() -> str:
-    here = os.path.dirname(__file__)
-    candidates = [
-        os.path.join(here, "assests", "metaman.png"),
-        os.path.join(here, "assets", "metaman.png"),
+    search_roots = []
+    if getattr(sys, "frozen", False):
+        search_roots.extend([getattr(sys, "_MEIPASS", ""), os.path.dirname(sys.executable)])
+    search_roots.append(os.path.dirname(__file__))
+
+    relative_candidates = [
+        os.path.join("assests", "metaman.png"),
+        os.path.join("assets", "metaman.png"),
+        os.path.join("MetaMan", "assests", "metaman.png"),
+        os.path.join("MetaMan", "assets", "metaman.png"),
     ]
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
+    for root in search_roots:
+        if not root:
+            continue
+        for relative_path in relative_candidates:
+            path = os.path.join(root, relative_path)
+            if os.path.isfile(path):
+                return path
     return ""
 
 
@@ -74,10 +90,12 @@ class MainWindow(QMainWindow):
         self.nav_tab = NavigationTab(self.state, on_load_session=self._load_session_everywhere)
         self.rec_tab = RecordingTab(self.state)
         self.pre_tab = PreprocessingTab(self.state)
+        self.staging_tab = StagingTab(self.state)
         self.reorg_tab = DataReorganizerTab(self.state)
         self.tabs.addTab(self.nav_tab, "Navigation")
         self.tabs.addTab(self.rec_tab, "Recording")
         self.tabs.addTab(self.pre_tab, "Preprocessing")
+        self.tabs.addTab(self.staging_tab, "Staging")
         self.tabs.addTab(self.reorg_tab, "Data reorganizer")
         root.addWidget(self.tabs, 1)
 
@@ -120,6 +138,10 @@ class MainWindow(QMainWindow):
         act_set_root.triggered.connect(self._menu_set_data_root)
         menu_file.addAction(act_set_root)
 
+        act_structure = QAction("\U0001f9e9  Design Data Structure...", self)
+        act_structure.triggered.connect(self._menu_design_structure)
+        menu_file.addAction(act_structure)
+
         act_refresh = QAction("Refresh All Lists", self)
         act_refresh.triggered.connect(self._refresh_everything)
         menu_file.addAction(act_refresh)
@@ -142,7 +164,7 @@ class MainWindow(QMainWindow):
 
     def _apply_visual_style(self):
         self.setStyleSheet(
-            """
+            SidePanelLayout.style_sheet() + """
             QWidget {
                 font-size: 11px;
             }
@@ -258,6 +280,20 @@ class MainWindow(QMainWindow):
 
         save_session_triplet(sess_path, meta, logger=log)
 
+    def _sync_pending_staging_for_project(self, project: str, log):
+        manifest = load_manifest(self.state.settings.data_root)
+        entry_ids = [
+            str(entry.get("id", "")).strip()
+            for entry in manifest
+            if str(entry.get("project", "")).strip() == project and entry.get("status") == "pending"
+        ]
+        entry_ids = [entry_id for entry_id in entry_ids if entry_id]
+        if not entry_ids:
+            return
+
+        log(f"[staging] Auto-syncing {len(entry_ids)} pending recording(s) for {project}.")
+        sync_pending(self.state.settings.data_root, log, entry_ids=entry_ids)
+
     def _start_backup_copy(self, project: str, experiment: str, destination_root: str, destination_kind: str, scheduled: bool):
         source_dir = self._experiment_dir(project, experiment) if experiment else self._project_dir(project)
         if not os.path.isdir(source_dir):
@@ -285,6 +321,11 @@ class MainWindow(QMainWindow):
             ok = False
             try:
                 log(f"[{mode}/{destination_label}] Starting: {scope} -> {destination_scope_root}")
+                if destination_kind == "server":
+                    try:
+                        self._sync_pending_staging_for_project(project, log)
+                    except Exception as exc:
+                        log(f"[warning] Staging auto-sync failed: {exc}")
                 sync_project_to_server(source_dir, destination_scope_root, log)
                 dt = max(time() - started, 1e-6)
                 log(f"[{mode}/{destination_label}] Finished in {dt:.1f}s.")
@@ -726,11 +767,15 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
-            self.rec_tab._refresh_lists()
+            self.rec_tab._refresh_from_project()
         except Exception:
             pass
         try:
             self.pre_tab._refresh_lists()
+        except Exception:
+            pass
+        try:
+            self.staging_tab._refresh_manifest_table()
         except Exception:
             pass
         try:
@@ -749,12 +794,16 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
-            self.rec_tab.ed_root.setText(self.state.settings.data_root)
+            self.rec_tab._refresh_from_project()
         except Exception:
             pass
         try:
             self.pre_tab.ed_data_root.setText(self.state.settings.data_root)
             self.pre_tab.ed_proc_root.setText(self.state.settings.processed_root)
+        except Exception:
+            pass
+        try:
+            self.staging_tab._refresh_manifest_table()
         except Exception:
             pass
         try:
@@ -764,6 +813,32 @@ class MainWindow(QMainWindow):
             pass
         self._refresh_everything()
         self.lbl_status.setText(f"Data root set: {self.state.settings.data_root}")
+
+    def _menu_design_structure(self):
+        project = self.state.current_project
+        if project:
+            schema = self.state.settings.get_project_structure_schema(project)
+            if not schema:
+                schema = self.state.settings.get_structure_schema()
+            if not schema:
+                schema = default_structure_schema()
+        else:
+            schema = self.state.settings.get_structure_schema()
+            if not schema:
+                schema = default_structure_schema()
+
+        schema = normalize_structure_schema(schema)
+        dlg = StructureDesignerDialog(schema, project_name=project, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        result = dlg.schema()
+        if project:
+            self.state.settings.put_project_structure_schema(project, result)
+            self.lbl_status.setText(f"Structure saved for project: {project}")
+        else:
+            self.state.settings.put_structure_schema(result)
+            self.lbl_status.setText("Default structure schema saved.")
 
     def _menu_new_project(self):
         name, ok = QInputDialog.getText(self, "New Project", "Project name:")
