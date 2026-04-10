@@ -18,9 +18,19 @@ from .tabs.navigation_tab import NavigationTab
 from .tabs.recording_tab import RecordingTab
 from .tabs.preprocessing_tab import PreprocessingTab
 from .tabs.data_reorganizer_tab import DataReorganizerTab
+from .structure_designer_dialog import StructureDesignerDialog
 from .services.server_sync import sync_project_to_server
 from .services.search_service import search_in_project
-from .io_ops import list_experiments, list_projects, load_session_metadata, save_session_triplet
+from .services.structure_schema import (
+    build_role_path,
+    default_structure_schema,
+    list_role_values,
+    load_project_schema,
+    resolve_role_path,
+    role_enabled,
+    save_project_schema,
+)
+from .io_ops import list_projects, load_session_metadata, save_session_triplet
 from .utils import run_in_thread
 
 
@@ -113,6 +123,10 @@ class MainWindow(QMainWindow):
         act_add_experiment = QAction("Add Experiment...", self)
         act_add_experiment.triggered.connect(self._menu_add_experiment)
         menu_file.addAction(act_add_experiment)
+
+        act_structure = QAction("Design Data Structure...", self)
+        act_structure.triggered.connect(self._menu_design_structure)
+        menu_file.addAction(act_structure)
 
         menu_file.addSeparator()
 
@@ -217,10 +231,33 @@ class MainWindow(QMainWindow):
         self.rec_tab.load_session(session_path)
         self.pre_tab._load_from_session(session_path)
 
+    def _default_schema(self):
+        try:
+            return self.state.settings.get_default_structure_schema()
+        except Exception:
+            return default_structure_schema()
+
+    def _project_schema(self, project: str):
+        return load_project_schema(
+            self.state.settings.raw_root,
+            project,
+            fallback=self._default_schema(),
+        )
+
     def _project_dir(self, project: str) -> str:
         return os.path.join(self.state.settings.raw_root, project)
 
     def _experiment_dir(self, project: str, experiment: str) -> str:
+        schema = self._project_schema(project)
+        resolved = resolve_role_path(
+            self.state.settings.raw_root,
+            schema,
+            role="experiment",
+            filters={"project": project, "experiment": experiment},
+            kind="raw",
+        )
+        if resolved:
+            return resolved
         return os.path.join(self.state.settings.raw_root, project, experiment)
 
     def _backup_job_key(self, project: str, experiment: str = "", destination_kind: str = "server") -> str:
@@ -235,6 +272,7 @@ class MainWindow(QMainWindow):
         if str(meta.get("Project", "")) != project:
             return
 
+        schema = self._project_schema(project)
         experiment = meta.get("Experiment", "") or self.state.current_experiment
         if not experiment:
             try:
@@ -246,14 +284,38 @@ class MainWindow(QMainWindow):
         subject = meta.get("Subject", "") or meta.get("Animal", "")
         session = meta.get("Session", "")
         destination_project = os.path.join(destination_root, project)
-        session_dir = os.path.join(self.state.settings.raw_root, project, experiment, subject, session)
         dest_key = "server_path" if destination_kind == "server" else "hdd_path"
+        project_dir = self._project_dir(project)
 
         for item in meta.get("file_list", []):
             src_path = item.get("path", "")
             if not src_path:
                 continue
-            dpath = src_path.replace(session_dir, os.path.join(destination_project, experiment, subject, session))
+            try:
+                rel = os.path.relpath(src_path, project_dir)
+                if rel.startswith(".."):
+                    values = {
+                        "project": project,
+                        "experiment": str(experiment or ""),
+                        "subject": str(subject or ""),
+                        "session": str(session or ""),
+                    }
+                    session_dir = build_role_path(
+                        self.state.settings.raw_root,
+                        schema,
+                        values,
+                        role="session",
+                        kind="raw",
+                    )
+                    if session_dir:
+                        rel = os.path.relpath(src_path, session_dir)
+                        dpath = os.path.join(destination_project, experiment, subject, session, rel)
+                    else:
+                        dpath = ""
+                else:
+                    dpath = os.path.join(destination_project, rel)
+            except Exception:
+                dpath = ""
             item[dest_key] = dpath if os.path.exists(dpath) else ""
 
         save_session_triplet(sess_path, meta, logger=log)
@@ -596,7 +658,14 @@ class MainWindow(QMainWindow):
 
         def fill_experiment_table(project: str, enabled_exps):
             tbl_exps.setRowCount(0)
-            exps = list_experiments(self._project_dir(project))
+            schema = self._project_schema(project)
+            exps = list_role_values(
+                self.state.settings.raw_root,
+                schema,
+                role="experiment",
+                filters={"project": project},
+                kind="raw",
+            )
             enabled_set = {str(x).strip() for x in (enabled_exps or []) if str(x).strip()}
             for exp in exps:
                 r = tbl_exps.rowCount()
@@ -765,6 +834,46 @@ class MainWindow(QMainWindow):
         self._refresh_everything()
         self.lbl_status.setText(f"Data root set: {self.state.settings.data_root}")
 
+    def _menu_design_structure(self):
+        projects = list_projects(self.state.settings.raw_root)
+        scopes = ["Default (new projects)"] + projects
+        default_idx = 0
+        if self.state.current_project and self.state.current_project in projects:
+            default_idx = projects.index(self.state.current_project) + 1
+
+        scope, ok = QInputDialog.getItem(
+            self,
+            "Data Structure",
+            "Choose scope:",
+            scopes,
+            default_idx,
+            False,
+        )
+        if not ok or not scope:
+            return
+
+        if scope == "Default (new projects)":
+            initial = self._default_schema()
+            dlg = StructureDesignerDialog(initial, project_name="", parent=self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            self.state.settings.put_default_structure_schema(dlg.schema())
+            self.lbl_status.setText("Updated default data structure schema.")
+        else:
+            project = scope
+            schema = self._project_schema(project)
+            dlg = StructureDesignerDialog(schema, project_name=project, parent=self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            save_project_schema(
+                self.state.settings.raw_root,
+                self.state.settings.processed_root,
+                project,
+                dlg.schema(),
+            )
+            self.lbl_status.setText(f"Updated schema for project: {project}")
+        self._refresh_everything()
+
     def _menu_new_project(self):
         name, ok = QInputDialog.getText(self, "New Project", "Project name:")
         if not ok:
@@ -774,10 +883,30 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Project", "Project name cannot be empty.")
             return
 
+        schema = self._default_schema()
+        ask = QMessageBox.question(
+            self,
+            "Project Structure",
+            "Customize this project's folder structure now?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ask == QMessageBox.Yes:
+            dlg = StructureDesignerDialog(schema, project_name=project, parent=self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            schema = dlg.schema()
+
         raw_project = os.path.join(self.state.settings.raw_root, project)
         proc_project = os.path.join(self.state.settings.processed_root, project)
         os.makedirs(raw_project, exist_ok=True)
         os.makedirs(proc_project, exist_ok=True)
+        save_project_schema(
+            self.state.settings.raw_root,
+            self.state.settings.processed_root,
+            project,
+            schema,
+        )
         self.state.set_current(project=project, experiment="", animal="", session="", session_path="")
         self._refresh_everything()
         self.lbl_status.setText(f"Project ready: {project}")
@@ -801,8 +930,39 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Experiment", "Experiment name cannot be empty.")
             return
 
-        raw_exp = os.path.join(self.state.settings.raw_root, project, experiment)
-        proc_exp = os.path.join(self.state.settings.processed_root, project, experiment)
+        schema = self._project_schema(project)
+        if not role_enabled(schema, "experiment", kind="raw"):
+            QMessageBox.warning(
+                self,
+                "Experiment level disabled",
+                "This project's raw schema has no enabled 'experiment' level.",
+            )
+            return
+
+        values = {"project": project, "experiment": experiment}
+        raw_exp = build_role_path(
+            self.state.settings.raw_root,
+            schema,
+            values,
+            role="experiment",
+            kind="raw",
+        )
+        proc_exp = build_role_path(
+            self.state.settings.processed_root,
+            schema,
+            values,
+            role="experiment",
+            kind="processed",
+        )
+        if not raw_exp or not proc_exp:
+            QMessageBox.warning(
+                self,
+                "Cannot create experiment",
+                "The current schema places 'experiment' after other required levels.\n"
+                "Create sessions from the Recording tab or adjust the schema.",
+            )
+            return
+
         os.makedirs(raw_exp, exist_ok=True)
         os.makedirs(proc_exp, exist_ok=True)
         self.state.set_current(project=project, experiment=experiment)
@@ -853,9 +1013,36 @@ class MainWindow(QMainWindow):
         import json
         import pandas as pd
 
-        subject_dir = os.path.join(self.state.settings.raw_root, proj, exp, subject)
-        for sess in sorted([d for d in os.listdir(subject_dir) if os.path.isdir(os.path.join(subject_dir, d))]):
-            smeta = os.path.join(subject_dir, sess, "metadata.json")
+        schema = self._project_schema(proj)
+        subject_dir = build_role_path(
+            self.state.settings.raw_root,
+            schema,
+            {"project": proj, "experiment": exp, "subject": subject},
+            role="subject",
+            kind="raw",
+        )
+        if not subject_dir or not os.path.isdir(subject_dir):
+            QMessageBox.warning(self, "Subject not found", "Could not resolve subject directory for this schema.")
+            return
+
+        sessions = list_role_values(
+            self.state.settings.raw_root,
+            schema,
+            role="session",
+            filters={"project": proj, "experiment": exp, "subject": subject},
+            kind="raw",
+        )
+        for sess in sessions:
+            sess_dir = build_role_path(
+                self.state.settings.raw_root,
+                schema,
+                {"project": proj, "experiment": exp, "subject": subject, "session": sess},
+                role="session",
+                kind="raw",
+            )
+            if not sess_dir:
+                continue
+            smeta = os.path.join(sess_dir, "metadata.json")
             if os.path.exists(smeta):
                 try:
                     data = json.loads(open(smeta, "r", encoding="utf-8").read())

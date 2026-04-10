@@ -11,12 +11,17 @@ from PySide6.QtWidgets import (
 
 from ..state import AppState
 from ..io_ops import (
-    list_experiments,
     list_projects,
-    list_sessions,
-    list_subjects,
     save_session_triplet,
     load_session_metadata,
+)
+from ..services.structure_schema import (
+    build_role_path,
+    extract_values_from_path,
+    list_role_values,
+    load_project_schema,
+    role_enabled,
+    role_label,
 )
 
 # Step menus (kept as requested)
@@ -55,6 +60,7 @@ class PreprocessingTab(QWidget):
         self.app_state = app_state
         self.meta: Dict[str, Any] = {}
         self._loading_session = False
+        self._active_schema = self._default_schema()
         self._build_ui()
         self._load_settings()
         self._refresh_lists()
@@ -84,13 +90,17 @@ class PreprocessingTab(QWidget):
         root.addLayout(row_sel0)
 
         row_sel1 = QHBoxLayout()
-        row_sel1.addWidget(QLabel("Project"))
+        self.lbl_project = QLabel("Project")
+        row_sel1.addWidget(self.lbl_project)
         self.cb_proj = QComboBox(); self.cb_proj.setEditable(False); row_sel1.addWidget(self.cb_proj, 1)
-        row_sel1.addWidget(QLabel("Experiment"))
+        self.lbl_experiment = QLabel("Experiment")
+        row_sel1.addWidget(self.lbl_experiment)
         self.cb_exp = QComboBox(); self.cb_exp.setEditable(False); row_sel1.addWidget(self.cb_exp, 1)
-        row_sel1.addWidget(QLabel("Subject"))
+        self.lbl_subject = QLabel("Subject")
+        row_sel1.addWidget(self.lbl_subject)
         self.cb_sub = QComboBox(); self.cb_sub.setEditable(False); row_sel1.addWidget(self.cb_sub, 1)
-        row_sel1.addWidget(QLabel("Session"))
+        self.lbl_session = QLabel("Session")
+        row_sel1.addWidget(self.lbl_session)
         self.cb_sess = QComboBox(); self.cb_sess.setEditable(False); row_sel1.addWidget(self.cb_sess, 1)
         root.addLayout(row_sel1)
 
@@ -186,6 +196,35 @@ class PreprocessingTab(QWidget):
         # Hook step selection
         self.steps.currentRowChanged.connect(self._update_param_comment)
 
+    def _default_schema(self):
+        try:
+            return self.app_state.settings.get_default_structure_schema()
+        except Exception:
+            return {}
+
+    def _project_schema(self, project_name: str):
+        return load_project_schema(
+            self._raw_root(),
+            project_name,
+            fallback=self._default_schema(),
+        )
+
+    def _current_schema(self):
+        proj = self.cb_proj.currentText().strip()
+        if proj:
+            self._active_schema = self._project_schema(proj)
+        return self._active_schema
+
+    def _update_role_labels(self):
+        schema = self._current_schema()
+        self.lbl_project.setText(role_label(schema, "project", kind="raw"))
+        self.lbl_experiment.setText(role_label(schema, "experiment", kind="raw"))
+        self.lbl_subject.setText(role_label(schema, "subject", kind="raw"))
+        self.lbl_session.setText(role_label(schema, "session", kind="raw"))
+        self.cb_exp.setEnabled(role_enabled(schema, "experiment", kind="raw"))
+        self.cb_sub.setEnabled(role_enabled(schema, "subject", kind="raw"))
+        self.cb_sess.setEnabled(role_enabled(schema, "session", kind="raw"))
+
     def _choose_data_root(self):
         d = QFileDialog.getExistingDirectory(self, "Choose data root", self.ed_data_root.text() or "")
         if not d:
@@ -266,8 +305,21 @@ class PreprocessingTab(QWidget):
 
     def _on_project_changed(self, _index: int = -1):
         proj = self.cb_proj.currentText().strip()
+        self._active_schema = self._project_schema(proj) if proj else self._default_schema()
+        self._update_role_labels()
         keep_exp = self.cb_exp.currentText().strip()
-        items = list_experiments(os.path.join(self._raw_root(), proj)) if proj else []
+        schema = self._current_schema()
+        items = (
+            list_role_values(
+                self._raw_root(),
+                schema,
+                role="experiment",
+                filters={"project": proj},
+                kind="raw",
+            )
+            if proj
+            else []
+        )
         self._set_combo_items(self.cb_exp, items, keep_exp)
         self._on_experiment_changed()
 
@@ -275,7 +327,18 @@ class PreprocessingTab(QWidget):
         proj = self.cb_proj.currentText().strip()
         exp = self.cb_exp.currentText().strip()
         keep_sub = self.cb_sub.currentText().strip()
-        items = list_subjects(os.path.join(self._raw_root(), proj, exp)) if (proj and exp) else []
+        schema = self._current_schema()
+        items = (
+            list_role_values(
+                self._raw_root(),
+                schema,
+                role="subject",
+                filters={"project": proj, "experiment": exp},
+                kind="raw",
+            )
+            if proj and exp
+            else []
+        )
         self._set_combo_items(self.cb_sub, items, keep_sub)
         self._on_subject_changed()
 
@@ -284,7 +347,18 @@ class PreprocessingTab(QWidget):
         exp = self.cb_exp.currentText().strip()
         sub = self.cb_sub.currentText().strip()
         keep_sess = self.cb_sess.currentText().strip()
-        items = list_sessions(os.path.join(self._raw_root(), proj, exp, sub)) if (proj and exp and sub) else []
+        schema = self._current_schema()
+        items = (
+            list_role_values(
+                self._raw_root(),
+                schema,
+                role="session",
+                filters={"project": proj, "experiment": exp, "subject": sub},
+                kind="raw",
+            )
+            if proj and exp and sub
+            else []
+        )
         self._set_combo_items(self.cb_sess, items, keep_sess)
         self._persist_settings()
 
@@ -295,12 +369,28 @@ class PreprocessingTab(QWidget):
         self._try_load_current_session(show_warning=False)
 
     def _selected_session_dir(self) -> str:
+        schema = self._current_schema()
+        values = {
+            "project": self.cb_proj.currentText().strip(),
+            "experiment": self.cb_exp.currentText().strip(),
+            "subject": self.cb_sub.currentText().strip(),
+            "session": self.cb_sess.currentText().strip(),
+        }
+        path = build_role_path(
+            self._raw_root(),
+            schema,
+            values,
+            role="session",
+            kind="raw",
+        )
+        if path:
+            return path
         return os.path.join(
             self._raw_root(),
-            self.cb_proj.currentText().strip(),
-            self.cb_exp.currentText().strip(),
-            self.cb_sub.currentText().strip(),
-            self.cb_sess.currentText().strip(),
+            values.get("project", ""),
+            values.get("experiment", ""),
+            values.get("subject", ""),
+            values.get("session", ""),
         )
 
     def _try_load_current_session(self, show_warning: bool):
@@ -333,6 +423,19 @@ class PreprocessingTab(QWidget):
 
     def _load_from_session(self, session_dir: str):
         self.meta = load_session_metadata(session_dir) or {}
+        if not self.meta:
+            root = self._raw_root()
+            rel_parts = [p for p in os.path.relpath(session_dir, root).split(os.sep) if p and p != "."]
+            project = rel_parts[0] if rel_parts else ""
+            schema = self._project_schema(project) if project else self._default_schema()
+            vals = extract_values_from_path(root, schema, session_dir, kind="raw")
+            self.meta = {
+                "Project": vals.get("project", ""),
+                "Experiment": vals.get("experiment", ""),
+                "Subject": vals.get("subject", ""),
+                "Session": vals.get("session", ""),
+                "preprocessing": [],
+            }
         self._loading_session = True
         try:
             if self.meta:
@@ -393,7 +496,23 @@ class PreprocessingTab(QWidget):
         if not (proj and exp and subject and session and root):
             QMessageBox.warning(self, "Missing", "Missing processed root or session info.")
             return
-        session_proc = os.path.join(root, proj, exp, subject, session)
+
+        schema = self._project_schema(str(proj))
+        values = {
+            "project": str(proj),
+            "experiment": str(exp),
+            "subject": str(subject),
+            "session": str(session),
+        }
+        session_proc = build_role_path(
+            root,
+            schema,
+            values,
+            role="session",
+            kind="processed",
+        )
+        if not session_proc:
+            session_proc = os.path.join(root, str(proj), str(exp), str(subject), str(session))
         os.makedirs(session_proc, exist_ok=True)
         save_session_triplet(session_proc, self.meta)
         self.app_state.settings.processed_root = root
