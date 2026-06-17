@@ -23,6 +23,8 @@ SUCCESS = "#1f9d57"      # green
 SUCCESS_SOFT = "#e3f4ea"
 SEL = "#ece7fe"          # selected row fill (subtle lavender)
 
+# Preferred UI font is bundled Inter (assets/fonts/InterVariable.ttf); this is
+# the fallback used when Inter is not available at runtime.
 FONT_FAMILY = "Segoe UI"
 
 STYLESHEET = """
@@ -198,12 +200,35 @@ QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
     border-radius: 11px; padding: 3px 11px;
 }
 #ProjectBarSep { color: #e6e3f0; max-width: 1px; }
-#Wordmark {
-    color: #6b48f2; font-weight: 800; font-size: 16px; padding-right: 4px;
-}
 
 /* generic helper text */
 QLabel#Hint { color: #8b8694; }
+
+/* ── left navigation rail ─────────────────────────────────────────── */
+#NavRail {
+    background: #faf9fd;
+    border-right: 1px solid #e6e3f0;
+    min-width: 240px; max-width: 240px;
+}
+#NavRail QWidget#ProjectBarCompact { background: transparent; }
+#NavDivider { background: #ece9f3; border: none; margin: 4px 0; }
+#NavBrandText {
+    color: #6b48f2; font-weight: 800; font-size: 16px;
+}
+#NavSection {
+    color: #a39ead; font-weight: 700; font-size: 10px;
+    padding: 2px 2px; letter-spacing: 1px;
+}
+#NavItem {
+    text-align: left; font-size: 13px; font-weight: 600;
+    color: #5a5566; background: transparent;
+    border: none; border-radius: 10px; padding: 0 12px;
+}
+#NavItem:hover { background: #ece7fe; color: #3a3545; }
+#NavItem:checked {
+    background: #ffffff; color: #5a3fe0; font-weight: 700;
+    border: 1px solid #e3dcfb;
+}
 
 /* ── side panel (Record / Transfer / Import) ──────────────────────── */
 #SidePanelBar {
@@ -216,4 +241,24 @@ QLabel#Hint { color: #8b8694; }
 }
 #SidePanelButton:hover { background: #ece7fe; color: #5a3fe0; }
 #SidePanelButton:checked { background: #7c5cfc; color: #ffffff; }
+
+/* ── explorer (QTreeView file browser) ────────────────────────────── */
+QTreeView {
+    background: #ffffff; color: #232026;
+    alternate-background-color: #faf9fd;
+    border: 1px solid #e6e3f0; border-radius: 10px; outline: 0;
+}
+QTreeView::item { padding: 3px 4px; border-radius: 5px; }
+QTreeView::item:hover { background: #f3f0fb; }
+QTreeView::item:selected { background: #ece7fe; color: #2a2533; }
+#ExplorerPanelTitle { font-weight: 800; color: #5a3fe0; font-size: 13px; }
+#BackupSummary { color: #3a3545; }
+
+/* ── guarded destructive button ───────────────────────────────────── */
+QPushButton#Danger {
+    background: #ed4245; color: #ffffff; border: none; font-weight: 700;
+    padding: 9px 18px;
+}
+QPushButton#Danger:hover { background: #d83a3d; }
+QPushButton#Danger:disabled { background: #f2b6b7; color: #ffffff; }
 """

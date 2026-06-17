@@ -12,17 +12,21 @@ import os
 from typing import List
 
 from PySide6.QtCore import Qt, QTime
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -31,9 +35,28 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..services import fs_ops
+from ..services.backup_report import format_report_text, human_size, report_dir
 from ..side_panel import SidePanelLayout
 from ..state import AppState
 from .staging_tab import StagingTab
+
+_STATUS_COLORS = {
+    "success": QColor("#1f9d57"),
+    "partial": QColor("#e8a83e"),
+    "error": QColor("#ed4245"),
+}
+
+
+def _fmt_duration(seconds: float) -> str:
+    s = int(round(seconds or 0))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m {sec:02d}s"
+    if m:
+        return f"{m}m {sec:02d}s"
+    return f"{sec}s"
 
 
 class TransferTab(QWidget):
@@ -54,7 +77,16 @@ class TransferTab(QWidget):
         self._side.add_panel("☁️", "Backup", self._build_backup_panel(), default=True)
         self._side.add_panel("\U0001f517", "Staging", self.staging)
         self._side.add_panel("⏰", "Schedule", self._build_schedule_panel())
-        self._side.panel_changed.connect(lambda _i: self.refresh())
+        self._history_idx = self._side.add_panel("\U0001f9fe", "History", self._build_history_panel())
+        self._side.panel_changed.connect(self._on_panel_changed)
+
+    def _on_panel_changed(self, _index: int):
+        self.refresh()
+        self.refresh_history()
+
+    def show_history_panel(self):
+        self._side.switch_to(self._history_idx)
+        self.refresh_history()
 
     def _active_project(self) -> str:
         return (self.app_state.current_project
@@ -339,3 +371,153 @@ class TransferTab(QWidget):
             self.lbl_sc_status.setText(f"Enabled at {hhmm}.  Last run: {sched.get('last_run_date', 'never')}")
         else:
             self.lbl_sc_status.setText("Auto-backup is disabled.")
+
+    # ── History panel ──────────────────────────────────────────────────
+    def _build_history_panel(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+
+        grp = QGroupBox("Last backup")
+        gl = QVBoxLayout(grp)
+        self.lbl_hist_summary = QLabel("No backups recorded yet.")
+        self.lbl_hist_summary.setWordWrap(True)
+        self.lbl_hist_summary.setObjectName("BackupSummary")
+        gl.addWidget(self.lbl_hist_summary)
+        lay.addWidget(grp)
+
+        ctl = QHBoxLayout()
+        self.chk_hist_all = QCheckBox("Show all projects")
+        self.chk_hist_all.toggled.connect(lambda _c: self.refresh_history())
+        ctl.addWidget(self.chk_hist_all)
+        ctl.addStretch(1)
+        b_refresh = QPushButton("Refresh")
+        b_refresh.clicked.connect(self.refresh_history)
+        ctl.addWidget(b_refresh)
+        lay.addLayout(ctl)
+
+        split = QSplitter(Qt.Vertical)
+        self.tbl_hist = QTableWidget(0, 8)
+        self.tbl_hist.setHorizontalHeaderLabels([
+            "Finished", "Project", "Scope", "Destination", "Status", "Files", "Copied", "Duration",
+        ])
+        self.tbl_hist.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.tbl_hist.horizontalHeader().setStretchLastSection(True)
+        self.tbl_hist.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tbl_hist.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl_hist.setAlternatingRowColors(True)
+        self.tbl_hist.itemSelectionChanged.connect(self._on_hist_row_selected)
+        split.addWidget(self.tbl_hist)
+
+        detail = QWidget()
+        dl = QVBoxLayout(detail)
+        dl.setContentsMargins(0, 0, 0, 0)
+        self.txt_hist_detail = QTextEdit()
+        self.txt_hist_detail.setReadOnly(True)
+        mono = QFont("Consolas" if os.name == "nt" else "Monospace")
+        mono.setStyleHint(QFont.Monospace)
+        self.txt_hist_detail.setFont(mono)
+        self.txt_hist_detail.setPlaceholderText("Select a run to see its full report…")
+        dl.addWidget(self.txt_hist_detail, 1)
+        drow = QHBoxLayout()
+        b_report = QPushButton("Open report folder")
+        b_report.clicked.connect(self._open_selected_report)
+        drow.addWidget(b_report)
+        b_dest = QPushButton("Open destination")
+        b_dest.clicked.connect(self._open_selected_destination)
+        drow.addWidget(b_dest)
+        drow.addStretch(1)
+        dl.addLayout(drow)
+        split.addWidget(detail)
+        split.setSizes([260, 220])
+        lay.addWidget(split, 1)
+        return w
+
+    def refresh_history(self):
+        if not hasattr(self, "tbl_hist"):
+            return
+        project = self._active_project()
+        show_all = self.chk_hist_all.isChecked()
+        runs = self.app_state.settings.get_backup_history(
+            project=None if show_all else (project or None)
+        )
+        self._render_summary(project)
+        self.tbl_hist.setRowCount(0)
+        for rec in runs:
+            r = self.tbl_hist.rowCount()
+            self.tbl_hist.insertRow(r)
+            status = str(rec.get("status", ""))
+            it0 = QTableWidgetItem(rec.get("finished_at", "") or rec.get("started_at", ""))
+            it0.setData(Qt.UserRole, rec)
+            self.tbl_hist.setItem(r, 0, it0)
+            self.tbl_hist.setItem(r, 1, QTableWidgetItem(rec.get("project", "")))
+            self.tbl_hist.setItem(r, 2, QTableWidgetItem(rec.get("experiment", "") or "(whole project)"))
+            self.tbl_hist.setItem(
+                r, 3, QTableWidgetItem("External HDD" if rec.get("destination_kind") == "hdd" else "Server"))
+            st = QTableWidgetItem(status.upper())
+            st.setForeground(_STATUS_COLORS.get(status, QColor("#888")))
+            st.setFont(QFont("", -1, QFont.Bold))
+            self.tbl_hist.setItem(r, 4, st)
+            self.tbl_hist.setItem(r, 5, QTableWidgetItem(str(rec.get("files_total", 0))))
+            copied = int(rec.get("copied", 0)) + int(rec.get("updated", 0))
+            self.tbl_hist.setItem(r, 6, QTableWidgetItem(f"{copied} · {human_size(rec.get('bytes_copied', 0))}"))
+            self.tbl_hist.setItem(r, 7, QTableWidgetItem(_fmt_duration(rec.get("duration_s", 0))))
+        self.tbl_hist.resizeColumnsToContents()
+
+    def _render_summary(self, project: str):
+        if not project:
+            self.lbl_hist_summary.setText("Select a project to see its last backup.")
+            return
+        last = self.app_state.settings.get_last_backup_for(project)
+        if not last:
+            self.lbl_hist_summary.setText(f"No backups recorded for '{project}' yet.")
+            return
+        dest = "External HDD" if last.get("destination_kind") == "hdd" else "Server"
+        scope = last.get("experiment", "") or "whole project"
+        copied = int(last.get("copied", 0)) + int(last.get("updated", 0))
+        self.lbl_hist_summary.setText(
+            f"<b>{project}</b> → {dest} ({scope})<br>"
+            f"{last.get('finished_at', '')} · <b>{last.get('status', '').upper()}</b><br>"
+            f"{copied} copied · {last.get('skipped', 0)} unchanged · {last.get('failed', 0)} failed · "
+            f"{human_size(last.get('bytes_copied', 0))} in {_fmt_duration(last.get('duration_s', 0))}"
+        )
+
+    def _selected_run(self):
+        rows = self.tbl_hist.selectionModel().selectedRows()
+        row = rows[0].row() if rows else self.tbl_hist.currentRow()
+        if row < 0:
+            return None
+        it = self.tbl_hist.item(row, 0)
+        return it.data(Qt.UserRole) if it else None
+
+    def _on_hist_row_selected(self):
+        rec = self._selected_run()
+        if rec:
+            self.txt_hist_detail.setPlainText(format_report_text(rec))
+
+    def _open_selected_report(self):
+        rec = self._selected_run()
+        if not rec:
+            QMessageBox.information(self, "Report", "Select a run first.")
+            return
+        out_dir = report_dir(rec.get("destination_root", ""), rec.get("project", ""), rec.get("experiment", ""))
+        if not os.path.isdir(out_dir):
+            QMessageBox.warning(self, "Report", f"Report folder not found (destination unmounted?):\n{out_dir}")
+            return
+        try:
+            fs_ops.open_path(out_dir)
+        except Exception as e:
+            QMessageBox.critical(self, "Report", str(e))
+
+    def _open_selected_destination(self):
+        rec = self._selected_run()
+        if not rec:
+            QMessageBox.information(self, "Destination", "Select a run first.")
+            return
+        dest = rec.get("destination_path", "") or rec.get("destination_root", "")
+        if not dest or not os.path.exists(dest):
+            QMessageBox.warning(self, "Destination", "Destination folder not found / not mounted.")
+            return
+        try:
+            fs_ops.open_path(dest)
+        except Exception as e:
+            QMessageBox.critical(self, "Destination", str(e))

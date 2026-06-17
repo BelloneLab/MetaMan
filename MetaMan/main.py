@@ -12,13 +12,13 @@ if __package__ in (None, ""):
         sys.path.insert(0, _pkg_root)
     __package__ = "MetaMan"
 
-from PySide6.QtCore import QTime, QTimer, Qt
+from PySide6.QtCore import QObject, QTime, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QSplashScreen,
-    QPushButton, QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QTimeEdit,
+    QPushButton, QTableWidget, QTableWidgetItem, QTextEdit, QTimeEdit,
     QVBoxLayout, QWidget, QInputDialog
 )
 
@@ -30,7 +30,9 @@ from .tabs.preprocessing_tab import PreprocessingTab
 from .tabs.data_reorganizer_tab import DataReorganizerTab
 from .tabs.transfer_tab import TransferTab
 from .project_bar import ProjectContextBar
+from .nav_rail import WorkspaceShell
 from .services.server_sync import sync_project_to_server
+from .services.backup_report import build_record, write_report_files
 from .services.staging_service import load_manifest, sync_pending
 from .theme import STYLESHEET, FONT_FAMILY
 from .services.search_service import search_in_project
@@ -62,6 +64,39 @@ def _resolve_logo_path() -> str:
     return ""
 
 
+def _resolve_font_path() -> str:
+    search_roots = []
+    if getattr(sys, "frozen", False):
+        search_roots.extend([getattr(sys, "_MEIPASS", ""), os.path.dirname(sys.executable)])
+    search_roots.append(os.path.dirname(__file__))
+
+    relative_candidates = [
+        os.path.join("assets", "fonts", "InterVariable.ttf"),
+        os.path.join("MetaMan", "assets", "fonts", "InterVariable.ttf"),
+    ]
+    for root in search_roots:
+        if not root:
+            continue
+        for relative_path in relative_candidates:
+            path = os.path.join(root, relative_path)
+            if os.path.isfile(path):
+                return path
+    return ""
+
+
+def _load_app_font() -> str:
+    """Register the bundled Inter font and return its family, or the fallback."""
+    path = _resolve_font_path()
+    if path:
+        from PySide6.QtGui import QFontDatabase
+
+        font_id = QFontDatabase.addApplicationFont(path)
+        families = QFontDatabase.applicationFontFamilies(font_id)
+        if families:
+            return families[0]
+    return FONT_FAMILY
+
+
 def _set_windows_app_user_model_id():
     if os.name != "nt":
         return
@@ -71,6 +106,12 @@ def _set_windows_app_user_model_id():
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MetaMan.App")
     except Exception:
         pass
+
+
+class _BackupEmitter(QObject):
+    """Thread-safe bridge for completed backup runs (worker → GUI thread)."""
+
+    run_recorded = Signal(dict)
 
 
 class MainWindow(QMainWindow):
@@ -87,6 +128,8 @@ class MainWindow(QMainWindow):
         self.state = AppState()
         self._backup_jobs_in_progress = set()
         self._schedule_warning_cache = set()
+        self._backup_emitter = _BackupEmitter()
+        self._backup_emitter.run_recorded.connect(self._on_backup_run_recorded)
         self._build_ui()
         self._build_menu()
         self._apply_visual_style()
@@ -99,18 +142,21 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Global active-project bar drives every tab.
-        self.project_bar = ProjectContextBar(self.state)
+        # Global active-project bar drives every tab; folded into the nav rail.
+        self.project_bar = ProjectContextBar(self.state, compact=True)
         self.project_bar.project_selected.connect(self._activate_project_everywhere)
         self.project_bar.design_structure_requested.connect(self._menu_design_structure)
         self.project_bar.set_data_root_requested.connect(self._menu_set_data_root)
-        root.addWidget(self.project_bar)
 
-        self.tabs = QTabWidget()
+        self.tabs = WorkspaceShell(
+            logo_path=_resolve_logo_path(),
+            header_widget=self.project_bar,
+        )
         self.nav_tab = NavigationTab(
             self.state,
             on_load_session=self._load_session_everywhere,
             on_activate_project=self._activate_project_everywhere,
+            on_local_changed=self._on_datasets_changed,
         )
         self.rec_tab = RecordingTab(self.state)
         self.pre_tab = PreprocessingTab(self.state)
@@ -119,11 +165,11 @@ class MainWindow(QMainWindow):
         self.transfer_tab = TransferTab(self.state, self)
         self.staging_tab = self.transfer_tab.staging  # back-compat alias
 
-        self.tabs.addTab(self.nav_tab, "Browse")
-        self.tabs.addTab(self.rec_tab, "Record")
-        self.tabs.addTab(self.pre_tab, "Process")
-        self.tabs.addTab(self.transfer_tab, "Transfer")
-        self.tabs.addTab(self.reorg_tab, "Import")
+        self.tabs.add_page(self.nav_tab, "Browse", "\U0001f5c2️")
+        self.tabs.add_page(self.rec_tab, "Record", "⏺️")
+        self.tabs.add_page(self.pre_tab, "Process", "⚙️")
+        self.tabs.add_page(self.transfer_tab, "Transfer", "☁️")
+        self.tabs.add_page(self.reorg_tab, "Import", "\U0001f4e5")
         root.addWidget(self.tabs, 1)
 
         # Status bar with a permanent active-project indicator.
@@ -149,6 +195,7 @@ class MainWindow(QMainWindow):
         add(menu_file, "Open Local Project…", lambda: self.project_bar._load_local())
         add(menu_file, "Open Server Project…", lambda: self.project_bar._load_server())
         menu_file.addSeparator()
+        add(menu_file, "Browse Server Projects", self._menu_make_local_copy)
         add(menu_file, "Refresh All Lists", self._refresh_everything)
         menu_file.addSeparator()
         add(menu_file, "Exit", self.close)
@@ -158,6 +205,7 @@ class MainWindow(QMainWindow):
         add(menu_proj, "Add Experiment…", self._menu_add_experiment)
         add(menu_proj, "\U0001f9e9  Design Data Structure…", self._menu_design_structure)
         add(menu_proj, "Open Project Folder", self._menu_open_project_folder)
+        add(menu_proj, "\U0001f5c4️  Make Local Copy from Server…", self._menu_make_local_copy)
         menu_proj.addSeparator()
         add(menu_proj, "Search in Project…", self._search)
         add(menu_proj, "Generate Subject Summary CSV…", self._animal_summary)
@@ -171,8 +219,9 @@ class MainWindow(QMainWindow):
         menu_tr = bar.addMenu("&Transfer")
         add(menu_tr, "Backup Now…", self._backup_project_now)
         add(menu_tr, "Schedule Backup…", self._schedule_backup)
+        add(menu_tr, "View Backup History…", self._menu_backup_history)
         menu_tr.addSeparator()
-        add(menu_tr, "Open Transfer Tab", lambda: self.tabs.setCurrentWidget(self.transfer_tab))
+        add(menu_tr, "Open Transfer Tab", lambda: self.tabs.set_current_widget(self.transfer_tab))
 
         # Help
         menu_help = bar.addMenu("&Help")
@@ -191,6 +240,31 @@ class MainWindow(QMainWindow):
     def _load_session_everywhere(self, session_path: str):
         self.rec_tab.load_session(session_path)
         self.pre_tab._load_from_session(session_path)
+
+    def _on_datasets_changed(self):
+        """A make-local-copy / rename / delete touched the local tree; refresh
+        the project picker and active-project indicator so new datasets show up.
+        (The Browse tab refreshes its own local tree.)"""
+        for refresh in (
+            self.project_bar.refresh,
+            self._update_active_project_indicator,
+        ):
+            try:
+                refresh()
+            except Exception:
+                pass
+
+    def _on_backup_run_recorded(self, record: dict):
+        """Persist a finished backup run and refresh the history view. Runs on
+        the GUI thread (settings writes + UI stay off the worker thread)."""
+        try:
+            self.state.settings.add_backup_run(record)
+        except Exception:
+            pass
+        try:
+            self.transfer_tab.refresh_history()
+        except Exception:
+            pass
 
     def _activate_project_everywhere(self, project_name: str):
         """Make *project_name* the active project across every tab. Selecting a
@@ -244,6 +318,22 @@ class MainWindow(QMainWindow):
                 import subprocess; subprocess.run(["xdg-open", target])
         except Exception as e:
             QMessageBox.critical(self, "Open error", f"Failed to open:\n{target}\n\n{e}")
+
+    def _menu_make_local_copy(self):
+        """Jump to Browse ▸ Server tab, so the user can pick an experiment /
+        session and right-click ▸ Make local copy into the local rawData root."""
+        self.tabs.set_current_widget(self.nav_tab)
+        try:
+            self.nav_tab.focus_server_tab()
+        except Exception:
+            pass
+
+    def _menu_backup_history(self):
+        self.tabs.set_current_widget(self.transfer_tab)
+        try:
+            self.transfer_tab.show_history_panel()
+        except Exception:
+            pass
 
     def _menu_about(self):
         QMessageBox.information(
@@ -312,7 +402,7 @@ class MainWindow(QMainWindow):
 
         save_session_triplet(sess_path, meta, logger=log)
 
-    def _sync_pending_staging_for_project(self, project: str, log):
+    def _sync_pending_staging_for_project(self, project: str, log) -> int:
         manifest = load_manifest(self.state.settings.data_root)
         entry_ids = [
             str(entry.get("id", "")).strip()
@@ -321,10 +411,11 @@ class MainWindow(QMainWindow):
         ]
         entry_ids = [entry_id for entry_id in entry_ids if entry_id]
         if not entry_ids:
-            return
+            return 0
 
         log(f"[staging] Auto-syncing {len(entry_ids)} pending recording(s) for {project}.")
         sync_pending(self.state.settings.data_root, log, entry_ids=entry_ids)
+        return len(entry_ids)
 
     def _start_backup_copy(self, project: str, experiment: str, destination_root: str, destination_kind: str, scheduled: bool, log=None):
         sink = log or self.rec_tab.logger.log
@@ -361,25 +452,47 @@ class MainWindow(QMainWindow):
 
         def work():
             ok = False
+            stats = None
+            run_error = ""
+            staging_synced = 0
             try:
                 log(f"[{mode}/{destination_label}] Starting: {scope} -> {destination_scope_root}")
                 if destination_kind == "server":
                     try:
-                        self._sync_pending_staging_for_project(project, log)
+                        staging_synced = self._sync_pending_staging_for_project(project, log)
                     except Exception as exc:
                         log(f"[warning] Staging auto-sync failed: {exc}")
-                sync_project_to_server(source_dir, dest_parent, log, dest_name=dest_name)
+                stats = sync_project_to_server(source_dir, dest_parent, log, dest_name=dest_name)
                 dt = max(time() - started, 1e-6)
                 log(f"[{mode}/{destination_label}] Finished in {dt:.1f}s.")
                 if not experiment:
                     self._annotate_current_session_backup_paths(project, destination_root, destination_kind, log)
                 ok = True
             except Exception as e:
+                run_error = str(e)
                 log(f"[error] {mode}/{destination_label} failed for '{scope}': {e}")
             finally:
                 self._backup_jobs_in_progress.discard(job_key)
                 if scheduled and ok:
                     self.state.settings.mark_backup_schedule_run(project, datetime.now().strftime("%Y-%m-%d"), experiment=experiment)
+                # Build, persist (on the GUI thread) and write out the run report.
+                try:
+                    record = build_record(
+                        project=project,
+                        experiment=experiment,
+                        destination_kind=destination_kind,
+                        destination_root=destination_root,
+                        destination_path=destination_scope_root,
+                        source_path=source_dir,
+                        trigger="scheduled" if scheduled else "manual",
+                        stats=stats or {},
+                        staging_synced=staging_synced,
+                        error=run_error,
+                    )
+                    write_report_files(destination_root, record, log=log)
+                    self._backup_emitter.run_recorded.emit(record)
+                except Exception as exc:
+                    log(f"[warning] Could not record backup run: {exc}")
 
         run_in_thread(work)
 
@@ -1141,7 +1254,7 @@ def launch():
     app.setApplicationName("MetaMan")
     app.setApplicationDisplayName("MetaMan")
     app.setStyle("Fusion")
-    app.setFont(QFont(FONT_FAMILY, 10))
+    app.setFont(QFont(_load_app_font(), 10))
     app.setStyleSheet(STYLESHEET)
 
     splash = None

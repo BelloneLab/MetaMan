@@ -1,6 +1,5 @@
 import os
 import re
-import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QTime, Signal, QObject
@@ -44,10 +43,12 @@ from ..io_ops import (
 )
 from ..state import AppState
 from ..utils import run_in_thread
+from ..services import fs_ops
 from ..services.server_sync import sync_project_to_server
+from ..services.staging_service import server_raw_root
 from ..services.structure_schema import (
-    sublevels, is_marker_level, marker_folder_name, level_meta_key, LEVEL_COLORS,
-    META_KEY_FOR_LEVEL,
+    sublevels, is_marker_level, marker_folder_name, level_meta_key, level_label,
+    LEVEL_COLORS, META_KEY_FOR_LEVEL,
 )
 from ..services.metadata_scraper import scrape_session, merge_auto, classify_modality, is_probably_local
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
@@ -216,17 +217,29 @@ class _SyncEmitter(QObject):
 class NavigationTab(QWidget):
     DUMMY_CHILD_TEXT = "..."
 
-    def __init__(self, app_state: AppState, on_load_session, on_activate_project=None):
+    def __init__(self, app_state: AppState, on_load_session, on_activate_project=None,
+                 on_local_changed=None):
         super().__init__()
         self.app_state = app_state
         self.on_load_session = on_load_session
         self.on_activate_project = on_activate_project
+        self.on_local_changed = on_local_changed
         self._sync_running = False
         self._sync_emitter = _SyncEmitter()
         self._sync_emitter.log_line.connect(self._on_sync_log)
         self._sync_emitter.finished.connect(self._on_sync_finished)
+        # Server tab + local-copy worker state
+        self._server_display_root = ""
+        self._server_base = ""
+        self._copy_running = False
+        self._copy_emitter = _SyncEmitter()
+        self._copy_emitter.log_line.connect(self._on_copy_log)
+        self._copy_emitter.finished.connect(self._on_copy_finished)
         self._build_ui()
         self.refresh_tree(collapsed=True, lazy=True)
+        saved = self.app_state.settings.get_explorer_settings().get("server_root", "")
+        if saved:
+            self._set_server_root(saved)
 
     # ── UI ─────────────────────────────────────────────────────────
 
@@ -248,21 +261,51 @@ class NavigationTab(QWidget):
         # callers that still set its text.
         self.ed_root = QLineEdit(self.app_state.settings.data_root)
         self.ed_root.setVisible(False)
+
+        # Local | Server tabs: both are schema-driven dataset trees. They share
+        # the right-hand metadata panels; ``self.tree`` always points at the
+        # active one.
+        self._lr_tabs = QTabWidget()
+
+        # Local page
+        local_page = QWidget()
+        lp = QVBoxLayout(local_page)
+        lp.setContentsMargins(0, 0, 0, 0)
         row_top = QHBoxLayout()
-        row_top.addWidget(QLabel("Projects"))
+        row_top.addWidget(QLabel("Local projects"))
         row_top.addStretch(1)
         b_reload = QPushButton("Reload")
         b_reload.clicked.connect(lambda: self.refresh_tree(collapsed=True, lazy=True))
         row_top.addWidget(b_reload)
-        ll.addLayout(row_top)
+        lp.addLayout(row_top)
+        self.local_tree = self._make_tree()
+        lp.addWidget(self.local_tree, 1)
+        self._lr_tabs.addTab(local_page, "Local")
 
-        self.tree = QTreeWidget()
-        self.tree.setHeaderHidden(True)
-        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.tree.itemSelectionChanged.connect(self._on_select)
-        self.tree.itemExpanded.connect(self._on_item_expanded)
-        self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
-        ll.addWidget(self.tree, 1)
+        # Server page
+        server_page = QWidget()
+        sp = QVBoxLayout(server_page)
+        sp.setContentsMargins(0, 0, 0, 0)
+        srv_row = QHBoxLayout()
+        self.ed_server_root = QLineEdit()
+        self.ed_server_root.setPlaceholderText("Server share that holds the projects…")
+        self.ed_server_root.returnPressed.connect(
+            lambda: self._set_server_root(self.ed_server_root.text().strip()))
+        srv_row.addWidget(self.ed_server_root, 1)
+        b_srv_browse = QPushButton("Browse…")
+        b_srv_browse.clicked.connect(self._browse_server_root)
+        srv_row.addWidget(b_srv_browse)
+        b_srv_reload = QPushButton("Reload")
+        b_srv_reload.clicked.connect(self._refresh_server_tree)
+        srv_row.addWidget(b_srv_reload)
+        sp.addLayout(srv_row)
+        self.server_tree = self._make_tree()
+        sp.addWidget(self.server_tree, 1)
+        self._lr_tabs.addTab(server_page, "Server")
+
+        self._lr_tabs.currentChanged.connect(self._on_lr_tab_changed)
+        self.tree = self.local_tree  # active tree
+        ll.addWidget(self._lr_tabs, 1)
 
         btns = QHBoxLayout()
         for label, slot in [
@@ -274,6 +317,11 @@ class NavigationTab(QWidget):
             b.clicked.connect(slot)
             btns.addWidget(b)
         ll.addLayout(btns)
+
+        self.lbl_copy = QLabel("")
+        self.lbl_copy.setObjectName("Hint")
+        self.lbl_copy.setWordWrap(True)
+        ll.addWidget(self.lbl_copy)
 
         splitter.addWidget(left)
 
@@ -686,6 +734,144 @@ class NavigationTab(QWidget):
 
     # ── tree ──────────────────────────────────────────────────────
 
+    def _make_tree(self) -> QTreeWidget:
+        """A configured dataset tree wired to the shared handlers. Used for both
+        the Local and Server tabs."""
+        t = QTreeWidget()
+        t.setHeaderHidden(True)
+        t.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        t.itemSelectionChanged.connect(self._on_select)
+        t.itemExpanded.connect(self._on_item_expanded)
+        t.itemDoubleClicked.connect(self._on_item_double_clicked)
+        t.setContextMenuPolicy(Qt.CustomContextMenu)
+        t.customContextMenuRequested.connect(self._tree_context_menu)
+        return t
+
+    def _on_lr_tab_changed(self, idx: int):
+        self.tree = self.server_tree if idx == 1 else self.local_tree
+        self._on_select()
+
+    def _active_base(self) -> str:
+        """Folder that directly contains project folders for the active tab."""
+        if self.tree is self.server_tree:
+            return self._server_base
+        return self.app_state.settings.raw_root
+
+    def _server_active(self) -> bool:
+        return self.tree is self.server_tree
+
+    # ── server tab ─────────────────────────────────────────────────
+
+    def _browse_server_root(self):
+        start = self._server_display_root or self.ed_server_root.text().strip() or ""
+        d = QFileDialog.getExistingDirectory(self, "Choose the server projects share", start)
+        if d:
+            self._set_server_root(d)
+
+    def _set_server_root(self, path: str):
+        path = canon_path(path) if path else ""
+        self._server_display_root = path
+        self._server_base = server_raw_root(path) if (path and os.path.isdir(path)) else ""
+        self.ed_server_root.setText(path)
+        self.app_state.settings.put_explorer_settings({"server_root": path})
+        self._build_server_tree()
+
+    def _refresh_server_tree(self):
+        self._set_server_root(self.ed_server_root.text().strip())
+
+    def _build_server_tree(self):
+        self.server_tree.clear()
+        base = self._server_base
+        if not base or not os.path.isdir(base):
+            return
+        for proj in self._subdirs(base):
+            proj_dir = canon_path(os.path.join(base, proj))
+            pitem = QTreeWidgetItem([proj])
+            pitem.setIcon(0, _level_dot("project"))
+            pitem.setData(0, Qt.UserRole, ("project", proj_dir))
+            pitem.addChild(QTreeWidgetItem([self.DUMMY_CHILD_TEXT]))
+            self.server_tree.addTopLevelItem(pitem)
+
+    def focus_server_tab(self):
+        """Switch to the Server tab, pointing it at the active project's server
+        root if it has none yet (used by the menu shortcut)."""
+        self._lr_tabs.setCurrentIndex(1)
+        if not self._server_base:
+            active = (self.app_state.current_project
+                      or self.app_state.settings.get_loaded_project().get("name", "")).strip()
+            srv = self.app_state.settings.get_server_root_for_project(active) if active else ""
+            if srv and os.path.isdir(srv):
+                self._set_server_root(srv)
+
+    def _refresh_active_tree(self):
+        if self._server_active():
+            self._build_server_tree()
+        else:
+            self.refresh_tree(collapsed=True, lazy=True)
+
+    # ── make local copy (server → canonical rawData) ───────────────
+
+    def _make_local_copy(self, ctx):
+        if self._copy_running:
+            QMessageBox.information(self, "Make local copy", "A copy is already in progress.")
+            return
+        server_path = ctx["path"]
+        base = self._server_base
+        raw_root = self.app_state.settings.raw_root
+
+        dest_dir = raw_root
+        mapped = False
+        if base:
+            try:
+                rel = os.path.relpath(server_path, base)
+            except Exception:
+                rel = ""
+            if rel and not rel.startswith(".."):
+                dest_dir = os.path.join(raw_root, os.path.dirname(rel))
+                mapped = True
+        if not mapped:
+            ans = QMessageBox.question(
+                self, "Make local copy",
+                "This item is outside the server's project tree, so its position "
+                "can't be reconstructed.\n\n"
+                f"Copy it directly under the local rawData root?\n{raw_root}",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                return
+            dest_dir = raw_root
+
+        self._copy_running = True
+        self.lbl_copy.setText(f"Copying {os.path.basename(server_path)} → local…")
+        emitter = self._copy_emitter
+
+        def work():
+            ok = True
+            try:
+                stats = fs_ops.copy_into(server_path, dest_dir, lambda m: emitter.log_line.emit(m))
+                msg = (f"Local copy complete: {stats['copied'] + stats['updated']} copied, "
+                       f"{stats['skipped']} unchanged, {stats['failed']} failed.")
+                if stats["failed"]:
+                    ok = False
+            except Exception as e:
+                ok = False
+                msg = f"Local copy failed: {e}"
+            emitter.finished.emit(ok, msg)
+
+        run_in_thread(work)
+
+    def _on_copy_log(self, msg: str):
+        self.lbl_copy.setText(msg if len(msg) < 120 else msg[:117] + "…")
+
+    def _on_copy_finished(self, ok: bool, msg: str):
+        self._copy_running = False
+        self.lbl_copy.setText(msg)
+        self.refresh_tree(collapsed=True, lazy=True)  # local tree now holds the copy
+        if self.on_local_changed:
+            self.on_local_changed()
+        if not ok:
+            QMessageBox.warning(self, "Make local copy", msg)
+
     def _choose_root(self):
         d = QFileDialog.getExistingDirectory(self, "Choose data root", self.ed_root.text() or "")
         if not d:
@@ -698,7 +884,8 @@ class NavigationTab(QWidget):
         self.refresh_tree(collapsed=True, lazy=True)
 
     def refresh_tree(self, collapsed=True, lazy=True):
-        self.tree.clear()
+        """Rebuild the *local* projects tree from the raw root."""
+        self.local_tree.clear()
         self.app_state.settings.ensure_storage_roots()
         raw_root = self.app_state.settings.raw_root
         try:
@@ -712,35 +899,35 @@ class NavigationTab(QWidget):
             pitem = QTreeWidgetItem([proj])
             pitem.setIcon(0, _level_dot("project"))
             pitem.setData(0, Qt.UserRole, ("project", proj_dir))
-            self.tree.addTopLevelItem(pitem)
+            self.local_tree.addTopLevelItem(pitem)
             if lazy:
                 pitem.addChild(QTreeWidgetItem([self.DUMMY_CHILD_TEXT]))
             else:
                 self._populate_children(pitem, proj_dir, lazy)
 
         if collapsed:
-            self.tree.collapseAll()
+            self.local_tree.collapseAll()
 
         last = self.app_state.settings.last_opened_project
-        if last:
-            for i in range(self.tree.topLevelItemCount()):
-                item = self.tree.topLevelItem(i)
+        if last and self.tree is self.local_tree:
+            for i in range(self.local_tree.topLevelItemCount()):
+                item = self.local_tree.topLevelItem(i)
                 if item.text(0) == last:
-                    self.tree.setCurrentItem(item)
+                    self.local_tree.setCurrentItem(item)
                     self._on_select()
                     break
 
     def select_project(self, name: str):
-        """Highlight the given top-level project in the tree (no rebuild)."""
+        """Highlight the given top-level project in the local tree (no rebuild)."""
         name = (name or "").strip()
         if not name:
             return
-        for i in range(self.tree.topLevelItemCount()):
-            it = self.tree.topLevelItem(i)
+        for i in range(self.local_tree.topLevelItemCount()):
+            it = self.local_tree.topLevelItem(i)
             if it.text(0) == name:
-                self.tree.blockSignals(True)
-                self.tree.setCurrentItem(it)
-                self.tree.blockSignals(False)
+                self.local_tree.blockSignals(True)
+                self.local_tree.setCurrentItem(it)
+                self.local_tree.blockSignals(False)
                 return
 
     def _on_item_expanded(self, item):
@@ -834,7 +1021,7 @@ class NavigationTab(QWidget):
             return None
         kind, path = data
         project = self._owning_project(item)
-        proj_dir = canon_path(os.path.join(self.app_state.settings.raw_root, project))
+        proj_dir = canon_path(os.path.join(self._active_base(), project))
         subs = self._project_sublevels(project)
         try:
             rel = os.path.relpath(path, proj_dir)
@@ -850,6 +1037,9 @@ class NavigationTab(QWidget):
                 "parts": parts, "is_leaf": is_leaf}
 
     def _on_select(self):
+        snd = self.sender()
+        if isinstance(snd, QTreeWidget):
+            self.tree = snd
         ctx = self._selected_context()
         if not ctx:
             return
@@ -860,8 +1050,9 @@ class NavigationTab(QWidget):
         idx = self._node_depth(item) - 1  # this node's sublevel index (project -> -1)
 
         if kind == "project":
-            self.app_state.settings.last_opened_project = project
-            self.app_state.set_current(project=project, experiment="", animal="", session="", session_path="")
+            if not self._server_active():
+                self.app_state.settings.last_opened_project = project
+            self._browse_set_current(project=project, experiment="", animal="", session="", session_path="")
             info = self._without_stat_keys(load_project_info(path))
             dict_to_table(self.tbl_proj, {**humanize_stats(self._stats_for(project, path, 0)), **info})
             self.lbl_proj.setText(project); self.lbl_proj_path.setText(path)
@@ -870,8 +1061,8 @@ class NavigationTab(QWidget):
 
         if ctx["is_leaf"]:
             session = os.path.basename(path)
-            self.app_state.set_current(project=project, experiment=experiment, animal=subject,
-                                       session=session, session_path=path)
+            self._browse_set_current(project=project, experiment=experiment, animal=subject,
+                                     session=session, session_path=path)
             meta = load_session_metadata(path) or {}
             # Folder structure is authoritative for identity (fixes stale/swapped
             # values in old metadata.json, e.g. Subject="rawData").
@@ -893,8 +1084,8 @@ class NavigationTab(QWidget):
             return
 
         if kind == "experiment":
-            self.app_state.set_current(project=project, experiment=os.path.basename(path),
-                                       animal="", session="", session_path="")
+            self._browse_set_current(project=project, experiment=os.path.basename(path),
+                                     animal="", session="", session_path="")
             info = self._without_stat_keys(load_experiment_info(path))
             dict_to_table(self.tbl_exp, {**humanize_stats(self._stats_for(project, path, idx + 1)), **info})
             self.lbl_exp.setText(os.path.basename(path)); self.lbl_exp_path.setText(path)
@@ -902,8 +1093,8 @@ class NavigationTab(QWidget):
             return
 
         if kind == "subject":
-            self.app_state.set_current(project=project, experiment=experiment,
-                                       animal=os.path.basename(path), session="", session_path="")
+            self._browse_set_current(project=project, experiment=experiment,
+                                     animal=os.path.basename(path), session="", session_path="")
             info = self._without_stat_keys(load_subject_info(path))
             dict_to_table(self.tbl_sub, {**humanize_stats(self._stats_for(project, path, idx + 1)), **info})
             self.lbl_sub.setText(os.path.basename(path)); self.lbl_sub_path.setText(path)
@@ -911,8 +1102,15 @@ class NavigationTab(QWidget):
             return
 
         # Intermediate non-core level (recording / trial / marker): track context only.
-        self.app_state.set_current(project=project, experiment=experiment, animal=subject,
-                                   session="", session_path="")
+        self._browse_set_current(project=project, experiment=experiment, animal=subject,
+                                 session="", session_path="")
+
+    def _browse_set_current(self, **kwargs):
+        """Update the active dataset context, but only while browsing Local –
+        browsing the Server tab must never hijack the active local project."""
+        if self._server_active():
+            return
+        self.app_state.set_current(**kwargs)
 
     # ── stats (schema-driven) ─────────────────────────────────────
 
@@ -1029,25 +1227,127 @@ class NavigationTab(QWidget):
         if not sel:
             return
         target = canon_path(sel[1])
-        if not os.path.exists(target):
-            parent = canon_path(os.path.dirname(target))
-            if os.path.exists(parent):
-                target = parent
-            else:
-                QMessageBox.critical(self, "Path not found", f"Cannot find:\n{target}")
-                return
         try:
-            if os.name == "nt":
-                try:
-                    os.startfile(target)
-                except Exception:
-                    import subprocess; subprocess.run(["explorer", target])
-            elif sys.platform == "darwin":
-                import subprocess; subprocess.run(["open", target])
-            else:
-                import subprocess; subprocess.run(["xdg-open", target])
+            fs_ops.open_path(target)
         except Exception as e:
             QMessageBox.critical(self, "Open error", f"Failed to open:\n{target}\n\n{e}")
+
+    def _reveal_selected(self):
+        sel = self._get_selected()
+        if not sel:
+            return
+        try:
+            fs_ops.reveal_path(canon_path(sel[1]))
+        except Exception as e:
+            QMessageBox.critical(self, "Reveal", f"Could not reveal:\n{sel[1]}\n\n{e}")
+
+    # ── tree context menu (dataset management) ─────────────────────────
+
+    def _tree_context_menu(self, pos):
+        from PySide6.QtWidgets import QMenu
+        snd = self.sender()
+        if isinstance(snd, QTreeWidget):
+            self.tree = snd
+        item = self.tree.itemAt(pos)
+        if item is not None and item not in self.tree.selectedItems():
+            self.tree.setCurrentItem(item)
+        ctx = self._selected_context()
+        if not ctx:
+            return
+        server = self._server_active()
+        menu = QMenu(self)
+        menu.addAction("Open folder", self._open_selected_folder)
+        menu.addAction("Reveal in file manager", self._reveal_selected)
+        menu.addAction("Copy path", self._copy_selected_path)
+        if ctx["is_leaf"]:
+            menu.addAction("Load in Record / Process", self._load_selected_session)
+        if server:
+            menu.addSeparator()
+            scope = {"project": "project", "experiment": "experiment",
+                     "subject": "subject", "session": "session"}.get(ctx["kind"], "item")
+            menu.addAction(f"⬇  Make local copy of this {scope}", lambda: self._make_local_copy(ctx))
+        menu.addSeparator()
+        child = self._child_level(ctx)
+        if child is not None:
+            menu.addAction(f"New {level_label(child)}…", lambda c=child: self._tree_new_child(ctx, c))
+        menu.addAction("Rename…", lambda: self._tree_rename(ctx))
+        menu.addAction("Delete…", lambda: self._tree_delete(ctx))
+        menu.addSeparator()
+        menu.addAction("Refresh", self._refresh_active_tree)
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def _child_level(self, ctx) -> Optional[dict]:
+        """The schema level that a *new child* of the selected node would be, or
+        None if the node is a leaf or its child level is a fixed marker."""
+        subs = ctx["subs"]
+        child_idx = len(ctx["parts"])  # project node → 0 → first sublevel
+        if child_idx >= len(subs):
+            return None
+        lvl = subs[child_idx]
+        if is_marker_level(str(lvl.get("key", "")).strip().lower()):
+            return None
+        return lvl
+
+    def _tree_new_child(self, ctx, lvl):
+        from PySide6.QtWidgets import QInputDialog
+        label = level_label(lvl)
+        name, ok = QInputDialog.getText(self, f"New {label}", f"{label} name:")
+        if not ok:
+            return
+        clean = fs_ops.safe_name(name)
+        if not clean:
+            QMessageBox.warning(self, "New", "Name is empty after removing illegal characters.")
+            return
+        target = os.path.join(ctx["path"], clean)
+        if os.path.exists(target):
+            QMessageBox.warning(self, "New", f"'{clean}' already exists here.")
+            return
+        try:
+            os.makedirs(target)
+        except Exception as e:
+            QMessageBox.critical(self, "New", str(e))
+            return
+        self._refresh_active_tree()
+
+    def _tree_rename(self, ctx):
+        from PySide6.QtWidgets import QInputDialog
+        path = ctx["path"]
+        old = os.path.basename(path)
+        new, ok = QInputDialog.getText(self, "Rename", "New name:", text=old)
+        if not ok or not new.strip():
+            return
+        try:
+            fs_ops.rename_path(path, new)
+        except Exception as e:
+            QMessageBox.critical(self, "Rename", str(e))
+            return
+        self._refresh_active_tree()
+
+    def _tree_delete(self, ctx):
+        from PySide6.QtWidgets import QInputDialog
+        path = ctx["path"]
+        name = os.path.basename(path)
+        via = "the Recycle Bin" if fs_ops.trash_available() else "PERMANENT deletion (Send2Trash not installed)"
+        text, ok = QInputDialog.getText(
+            self, "Confirm delete",
+            f"This will delete:\n{path}\n\nDeletion uses {via}.\n\n"
+            f"Type the name '{name}' to confirm:",
+        )
+        if not (ok and text.strip() == name):
+            return
+        try:
+            how = fs_ops.delete_path(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Delete", f"Could not delete:\n{path}\n\n{e}")
+            return
+        self._refresh_active_tree()
+        if not self._server_active():
+            self.app_state.set_current(project=self.app_state.current_project, experiment="",
+                                       animal="", session="", session_path="")
+        QMessageBox.information(
+            self, "Delete",
+            f"{'Recycled' if how == 'trash' else 'Permanently deleted'}:\n{path}",
+        )
 
     def _copy_session_metadata_rows(self):
         """Copy selected rows (or all rows) from tbl_session as JSON to clipboard."""

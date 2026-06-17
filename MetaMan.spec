@@ -9,6 +9,11 @@ datas = []
 if logo.exists():
     datas.append((str(logo), "MetaMan/assests"))
 
+fonts_dir = project_root / "MetaMan" / "assets" / "fonts"
+if fonts_dir.is_dir():
+    for ttf in fonts_dir.glob("*.ttf"):
+        datas.append((str(ttf), "MetaMan/assets/fonts"))
+
 
 a = Analysis(
     ["run_app.py"],

@@ -46,11 +46,24 @@ python run_app.py
 
 ## Feature Tour
 
-### Navigation tab
-- Browse project -> experiment -> subject -> session
+### Navigation tab (Browse)
+- Two tabs share one metadata view: **Local** (your data root) and **Server**
+  (a network share). Both navigate the same project -> experiment -> subject ->
+  session hierarchy driven by each project's structure schema
+- On the **Server** tab, point at the share holding the projects and browse it
+  exactly like the local tree (browsing the server never changes your active
+  local project)
 - View and edit metadata at all hierarchy levels
 - Load subject metadata from CSV for one or multiple subjects
 - Copy/open paths quickly
+- **Right-click any node** for dataset actions: open, reveal, copy path, load a
+  session into Record/Process, create a child (experiment/subject/session),
+  **Rename** and **Delete** (guarded: type-to-confirm, recycle bin where
+  available)
+- **Make local copy** (Server tab): right-click a server project / experiment /
+  session -> it is reconstructed under your canonical local
+  `rawData/<project>/<experiment>/…` so you can pull data down for analysis (it
+  appears in the Local tab immediately)
 
 ### Recording tab
 - Create and update recording/session metadata
@@ -77,6 +90,17 @@ python run_app.py
 - Scheduled daily backups per project
 - Optional experiment-level backup selection
 - Last-used backup roots and schedules persisted
+
+### Backup history & reports (Transfer ▸ History)
+- Every backup run is recorded with full metadata: timestamp, scope,
+  destination, duration, files copied / updated / skipped / failed, bytes copied
+  and average throughput
+- A **Last backup** card summarises the active project's most recent run
+- A report file (`report_<ts>.json` + readable `.txt`, plus `history.csv`) is
+  written to `<destination>/_metaman_backup/<project>/` so the record travels
+  with the data
+- Copies are change-aware: an unchanged file is **skipped**, a same-name file
+  whose source is newer/different is **updated**
 
 ### Staging tab (linked recordings)
 - Record new sessions **locally** without downloading server projects
@@ -126,12 +150,15 @@ MetaMan/
     navigation_tab.py
     recording_tab.py
     preprocessing_tab.py
+    transfer_tab.py
     data_reorganizer_tab.py
     staging_tab.py
   services/
     data_reorganizer.py
     file_scanner.py
+    fs_ops.py
     server_sync.py
+    backup_report.py
     staging_service.py
     search_service.py
 ```

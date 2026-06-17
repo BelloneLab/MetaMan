@@ -18,7 +18,9 @@ from PySide6.QtWidgets import (
     QLabel,
     QMenu,
     QPushButton,
+    QSizePolicy,
     QToolButton,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -38,24 +40,76 @@ class ProjectContextBar(QWidget):
     design_structure_requested = Signal()
     set_data_root_requested = Signal()
 
-    def __init__(self, app_state, parent=None):
+    def __init__(self, app_state, parent=None, compact=False):
         super().__init__(parent)
         self.app_state = app_state
         self._loading = False
-        self.setObjectName("ProjectBar")
-        self._build_ui()
+        self._compact = compact
+        self.setObjectName("ProjectBarCompact" if compact else "ProjectBar")
+        if compact:
+            self._build_ui_compact()
+        else:
+            self._build_ui()
         self.refresh()
+
+    # ── build (vertical, folded into the nav rail) ─────────────────────
+    def _build_ui_compact(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(2, 0, 2, 0)
+        lay.setSpacing(6)
+
+        cap = QLabel("PROJECT")
+        cap.setObjectName("NavSection")
+        lay.addWidget(cap)
+
+        self.cb_project = QComboBox()
+        self.cb_project.setObjectName("ProjectBarCombo")
+        self.cb_project.setToolTip("Active project — drives Browse, Record, Process and Transfer")
+        self.cb_project.currentIndexChanged.connect(self._on_combo_changed)
+        lay.addWidget(self.cb_project)
+
+        self.btn_load = QToolButton()
+        self.btn_load.setText("Load project  ▾")
+        self.btn_load.setToolTip("Load a project from a local or server folder")
+        self.btn_load.setPopupMode(QToolButton.InstantPopup)
+        self.btn_load.setCursor(Qt.PointingHandCursor)
+        self.btn_load.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.btn_load.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        menu = QMenu(self.btn_load)
+        menu.addAction("Local folder…", self._load_local)
+        menu.addAction("Server folder…", self._load_server)
+        self.btn_load.setMenu(menu)
+        lay.addWidget(self.btn_load)
+
+        self.lbl_root = QLabel("—")
+        self.lbl_root.setObjectName("ProjectBarRoot")
+        self.lbl_root.setWordWrap(True)
+        self.lbl_root.setToolTip("Data root (click to change)")
+        self.lbl_root.setCursor(Qt.PointingHandCursor)
+        self.lbl_root.mousePressEvent = lambda _e: self.set_data_root_requested.emit()
+        lay.addWidget(self.lbl_root)
+
+        struct_cap = QLabel("STRUCTURE")
+        struct_cap.setObjectName("NavSection")
+        lay.addWidget(struct_cap)
+
+        self.lbl_structure = QLabel("—")
+        self.lbl_structure.setObjectName("ProjectBarStructure")
+        self.lbl_structure.setWordWrap(True)
+        self.lbl_structure.setToolTip("Folder nesting for this project — click Design to change")
+        lay.addWidget(self.lbl_structure)
+
+        b_design = QPushButton("Design structure…")
+        b_design.setCursor(Qt.PointingHandCursor)
+        b_design.setToolTip("Open the Structure Designer for this project")
+        b_design.clicked.connect(lambda: self.design_structure_requested.emit())
+        lay.addWidget(b_design)
 
     # ── build ─────────────────────────────────────────────────────────
     def _build_ui(self):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 7, 12, 7)
         lay.setSpacing(8)
-
-        wordmark = QLabel("MetaMan")
-        wordmark.setObjectName("Wordmark")
-        lay.addWidget(wordmark)
-        lay.addWidget(self._sep())
 
         lbl = QLabel("Project:")
         lbl.setObjectName("ProjectBarLabel")

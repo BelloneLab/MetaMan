@@ -30,6 +30,8 @@ class AppSettings:
             "recording_tab_settings": {},
             "preprocessing_tab_settings": {},
             "staging_tab_settings": {},
+            "explorer_settings": {},  # {"local_root": ..., "server_root": ...}
+            "backup_runs": [],  # capped list of backup-run records (newest last)
             "loaded_project": {},
             "structure_schema": {},
             "structure_schemas_by_project": {},
@@ -353,6 +355,51 @@ class AppSettings:
     def put_staging_tab_settings(self, data: Dict[str, Any]):
         self._data["staging_tab_settings"] = dict(data or {})
         self.save()
+
+    def get_explorer_settings(self) -> Dict[str, Any]:
+        raw = self._data.get("explorer_settings") or {}
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def put_explorer_settings(self, data: Dict[str, Any]):
+        self._data["explorer_settings"] = dict(data or {})
+        self.save()
+
+    # ── backup history ────────────────────────────────────────────────
+    _MAX_BACKUP_RUNS = 200
+
+    def add_backup_run(self, record: Dict[str, Any]):
+        """Append a backup-run record, keeping only the newest entries."""
+        runs = self._data.get("backup_runs")
+        if not isinstance(runs, list):
+            runs = []
+        runs.append(dict(record or {}))
+        if len(runs) > self._MAX_BACKUP_RUNS:
+            runs = runs[-self._MAX_BACKUP_RUNS:]
+        self._data["backup_runs"] = runs
+        self.save()
+
+    def get_backup_history(self, project: Optional[str] = None,
+                           limit: Optional[int] = None) -> list:
+        """Return backup-run records newest-first, optionally filtered by
+        *project* and capped to *limit*."""
+        runs = self._data.get("backup_runs")
+        if not isinstance(runs, list):
+            return []
+        out = [dict(r) for r in runs if isinstance(r, dict)]
+        if project:
+            out = [r for r in out if str(r.get("project", "")) == project]
+        out.reverse()  # newest first
+        if limit is not None:
+            out = out[:limit]
+        return out
+
+    def get_last_backup_for(self, project: str, kind: Optional[str] = None) -> Dict[str, Any]:
+        """Return the most recent backup-run record for *project* (optionally a
+        specific destination *kind*), or an empty dict."""
+        for r in self.get_backup_history(project=project):
+            if kind is None or str(r.get("destination_kind", "")) == kind:
+                return r
+        return {}
 
     def get_loaded_project(self) -> Dict[str, str]:
         proj = self._data.get("loaded_project") or {}
