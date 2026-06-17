@@ -12,6 +12,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QGroupBox,
@@ -52,6 +53,16 @@ def _tint(hex_color: str, factor: float = 0.12) -> str:
     return QColor(r, g, b).name()
 
 
+def _mix(hex_color: str, other: str, factor: float) -> str:
+    """Mix *hex_color* with *other* by *factor* (0 = other, 1 = hex_color)."""
+    a, b = QColor(hex_color), QColor(other)
+    return QColor(
+        int(b.red()   + (a.red()   - b.red())   * factor),
+        int(b.green() + (a.green() - b.green()) * factor),
+        int(b.blue()  + (a.blue()  - b.blue())  * factor),
+    ).name()
+
+
 # ═════════════════════════════════════════════════════════════════════════
 #  Block-chain editor: a drag-and-drop list of level blocks
 # ═════════════════════════════════════════════════════════════════════════
@@ -86,30 +97,31 @@ class BlockChainEditor(QWidget):
         self.list.setDefaultDropAction(Qt.MoveAction)
         self.list.setAlternatingRowColors(False)
         self.list.setSpacing(2)
+        self.list.setCursor(Qt.OpenHandCursor)
         self.list.setStyleSheet(
             f"""
             QListWidget {{
-                border: 2px solid {self._accent}40;
+                border: 1px solid {self._accent}55;
                 border-radius: 10px;
-                padding: 6px;
-                background: #fafcff;
+                padding: 8px;
+                background: #1b1a24;
             }}
             QListWidget::item {{
-                margin: 2px 0px;
-                padding: 10px 12px;
-                border: 1px solid #d0d9e8;
-                border-left: 5px solid #d0d9e8;
-                border-radius: 8px;
-                background: #ffffff;
+                margin: 3px 0px;
+                padding: 12px 12px;
+                border: 1px solid #3a3548;
+                border-left: 5px solid #3a3548;
+                border-radius: 10px;
+                background: #262232;
                 font-size: 12px;
             }}
             QListWidget::item:selected {{
-                border: 2px solid {self._accent};
+                border: 1px solid {self._accent};
                 border-left: 5px solid {self._accent};
-                background: #ecf4ff;
+                background: #322a4c;
             }}
             QListWidget::item:hover {{
-                background: #f0f5ff;
+                background: #2c2740;
             }}
             """
         )
@@ -135,9 +147,9 @@ class BlockChainEditor(QWidget):
         self.lbl_chain = QLabel("\u2014")
         self.lbl_chain.setWordWrap(True)
         self.lbl_chain.setStyleSheet(
-            "padding: 8px 10px; background: #ffffff; "
-            "border: 1px solid #d5deea; border-radius: 8px; "
-            "font-size: 12px; color: #333;"
+            "padding: 8px 10px; background: #1b1a24; "
+            "border: 1px solid #3a3548; border-radius: 8px; "
+            "font-size: 12px; color: #cfc7e6;"
         )
         root.addWidget(self.lbl_chain)
 
@@ -222,15 +234,16 @@ class BlockChainEditor(QWidget):
             kind = "variable"
 
         status_icon = "\u2705" if enabled else "\u26aa"  # ✅ / ⚪
-        item.setText(f"  {status_icon}  {icon}  {display}     \u2014  {kind}")
-        item.setToolTip(f"{desc}\nDrag to reorder \u2022 Double-click to toggle")
+        item.setText(f"  \u28ff    {status_icon}  {icon}   {display}      \u2014  {kind}")
+        item.setToolTip(f"{desc}\nDrag the \u28ff handle to reorder \u2022 Double-click to toggle")
 
-        # Colour coding
-        item.setForeground(QColor(color))
+        # Colour coding (grey/purple): brightened text on a dark, colour-tinted row
         if enabled:
-            item.setBackground(QColor(_tint(color, 0.08)))
+            item.setForeground(QColor(_mix(color, "#ffffff", 0.66)))
+            item.setBackground(QColor(_mix(color, "#262232", 0.20)))
         else:
-            item.setBackground(QColor("#f5f5f5"))
+            item.setForeground(QColor("#6f6885"))
+            item.setBackground(QColor("#201e2a"))
 
         font = item.font()
         font.setBold(enabled)
@@ -386,49 +399,71 @@ class BlockChainEditor(QWidget):
 class StructureDesignerDialog(QDialog):
     """Full-screen-ish dialog with two BlockChainEditors (raw + processed)."""
 
-    def __init__(self, schema: Dict[str, Any], project_name: str = "", parent=None):
+    def __init__(self, default_schema: Dict[str, Any], project_schema: Dict[str, Any] = None,
+                 project_name: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle("\U0001f9e9  Data Structure Designer")
-        self.resize(1060, 780)
-        self._schema = normalize_structure_schema(schema or default_structure_schema())
-        self._project_name = project_name.strip()
+        self.resize(1060, 800)
+        self._project_name = (project_name or "").strip()
+        # Two independent schemas the user can switch between and edit.
+        self._schemas: Dict[str, Dict[str, Any]] = {
+            "default": normalize_structure_schema(default_schema or default_structure_schema()),
+        }
+        if self._project_name:
+            self._schemas["project"] = normalize_structure_schema(
+                project_schema or default_schema or default_structure_schema()
+            )
+        self._scope = "default"
         self._build_ui()
-        self._load_schema_to_editors()
+        self._load_scope("default")
         self._refresh_previews()
 
     def _build_ui(self):
         root = QVBoxLayout(self)
         root.setSpacing(10)
 
-        scope = self._project_name or "Default (all new projects)"
-
         # Header
         hdr = QLabel(
-            f"<span style='font-size:14px; font-weight:700;'>"
-            f"\U0001f3d7\ufe0f  Structure playground "
-            f"<span style='color:#666;'>for {scope}</span></span><br/>"
-            "<span style='color:#555; font-size:11px;'>"
+            "<span style='font-size:14px; font-weight:700;'>"
+            "\U0001f3d7\ufe0f  Structure playground</span><br/>"
+            "<span style='color:#93a4c2; font-size:11px;'>"
             "Drag blocks up/down to reorder nesting levels \u2022 "
             "Check/uncheck to enable \u2022 "
             "Rename labels for custom folder names \u2022 "
-            "Add fixed <code>raw</code> / <code>processed</code> / "
+            "Add fixed <code>rawData</code> / <code>processedData</code> / "
             "<code>group</code> blocks anywhere."
             "</span>"
         )
         hdr.setWordWrap(True)
         hdr.setStyleSheet(
-            "padding: 10px 12px; background: #f0f4fb; "
-            "border: 1px solid #d0dae8; border-radius: 10px;"
+            "padding: 10px 12px; background: #221c33; color: #eae9f2; "
+            "border: 1px solid #3a3548; border-radius: 10px;"
         )
         root.addWidget(hdr)
+
+        # Scope selector: default (all projects) vs the loaded project
+        scope_row = QHBoxLayout()
+        scope_lbl = QLabel("Apply this structure to:")
+        scope_lbl.setStyleSheet("font-weight: 600;")
+        scope_row.addWidget(scope_lbl)
+        self.cb_scope = QComboBox()
+        self.cb_scope.addItem("\U0001f310  Default \u2013 all projects", "default")
+        if self._project_name:
+            self.cb_scope.addItem(
+                f"\U0001f4c1  This project only \u2013 {self._project_name}", "project"
+            )
+        self.cb_scope.setCursor(Qt.PointingHandCursor)
+        self.cb_scope.currentIndexChanged.connect(self._on_scope_changed)
+        scope_row.addWidget(self.cb_scope, 1)
+        root.addLayout(scope_row)
 
         # Two editors side by side
         editors = QHBoxLayout()
         self.editor_raw = BlockChainEditor(
-            "\U0001f4e6  Raw chain blocks", accent="#4e86d9"
+            "\U0001f4e6  Raw chain blocks", accent="#8b5cf6"
         )
         self.editor_proc = BlockChainEditor(
-            "\u2699\ufe0f  Processed chain blocks", accent="#2c9a5e"
+            "\u2699\ufe0f  Processed chain blocks", accent="#22a565"
         )
         editors.addWidget(self.editor_raw, 1)
         editors.addWidget(self.editor_proc, 1)
@@ -439,24 +474,19 @@ class StructureDesignerDialog(QDialog):
 
         # Previews
         previews = QGroupBox("\U0001f50d  Filesystem preview")
-        previews.setStyleSheet(
-            "QGroupBox { border: 1px solid #d0dae8; border-radius: 8px; "
-            "margin-top: 8px; padding-top: 10px; background: #fff; } "
-            "QGroupBox::title { color: #333; font-weight: 600; }"
-        )
         p_lay = QVBoxLayout(previews)
         p_lay.addWidget(QLabel("<b>Raw path pattern:</b>"))
         self.lbl_raw_preview = QLabel("\u2014")
         self.lbl_raw_preview.setWordWrap(True)
         self.lbl_raw_preview.setStyleSheet(
-            "padding: 6px; background: #f5f8fe; border-radius: 4px;"
+            "padding: 6px; background: #1b1a24; color:#cfc7e6; border:1px solid #3a3548; border-radius: 4px;"
         )
         p_lay.addWidget(self.lbl_raw_preview)
         p_lay.addWidget(QLabel("<b>Processed path pattern:</b>"))
         self.lbl_proc_preview = QLabel("\u2014")
         self.lbl_proc_preview.setWordWrap(True)
         self.lbl_proc_preview.setStyleSheet(
-            "padding: 6px; background: #f5faf5; border-radius: 4px;"
+            "padding: 6px; background: #1b1a24; color:#cfc7e6; border:1px solid #3a3548; border-radius: 4px;"
         )
         p_lay.addWidget(self.lbl_proc_preview)
         root.addWidget(previews)
@@ -475,15 +505,26 @@ class StructureDesignerDialog(QDialog):
         btns.rejected.connect(self.reject)
         root.addWidget(btns)
 
-    # ── load / reset ─────────────────────────────────────────────────────
+    # ── load / reset / scope ─────────────────────────────────────────────
 
-    def _load_schema_to_editors(self):
-        self.editor_raw.set_levels(self._schema.get("raw_levels", []))
-        self.editor_proc.set_levels(self._schema.get("processed_levels", []))
+    def _load_scope(self, scope: str):
+        schema = self._schemas.get(scope) or default_structure_schema()
+        self.editor_raw.set_levels(schema.get("raw_levels", []))
+        self.editor_proc.set_levels(schema.get("processed_levels", []))
+
+    def _on_scope_changed(self, _index: int = 0):
+        # Stash edits for the scope we are leaving, then load the new one.
+        self._schemas[self._scope] = self.schema()
+        self._scope = self.cb_scope.currentData() or "default"
+        self._load_scope(self._scope)
+        self._refresh_previews()
+
+    def selected_scope(self) -> str:
+        return self._scope
 
     def _reset_defaults(self):
-        self._schema = default_structure_schema()
-        self._load_schema_to_editors()
+        self._schemas[self._scope] = default_structure_schema()
+        self._load_scope(self._scope)
         self._refresh_previews()
 
     def _refresh_previews(self):
@@ -507,7 +548,7 @@ class StructureDesignerDialog(QDialog):
             return
         if not self._validate_core_order(schema, "processed_levels"):
             return
-        self._schema = schema
+        self._schemas[self._scope] = schema
         self.accept()
 
     def _validate_core_order(self, schema: Dict[str, Any], key: str) -> bool:

@@ -16,6 +16,8 @@ Structure Designer dialog.
 
 from typing import Any, Dict, List
 
+from ..config import RAW_DIR_NAME, PROCESSED_DIR_NAME
+
 # ── level key classifications ────────────────────────────────────────────
 
 CORE_LEVEL_KEYS: List[str] = ["project", "experiment", "subject", "session"]
@@ -67,8 +69,8 @@ LEVEL_DESCRIPTIONS: Dict[str, str] = {
     "session":    "Recording session (date, number, …)",
     "recording":  "Recording run within a session",
     "trial":      "Individual trial folder",
-    "raw":        "Fixed 'raw' marker folder",
-    "processed":  "Fixed 'processed' marker folder",
+    "raw":        f"Fixed '{RAW_DIR_NAME}' marker folder",
+    "processed":  f"Fixed '{PROCESSED_DIR_NAME}' marker folder",
     "group":      "Custom fixed grouping folder",
 }
 
@@ -84,8 +86,10 @@ def marker_folder_name(level: Dict[str, Any]) -> str:
     """Return the literal folder name for a marker level."""
     key = str(level.get("key", "")).strip().lower()
     label = str(level.get("label", "")).strip()
-    if key in ("raw", "processed"):
-        return label if (label and label.lower() != key) else key
+    if key == "raw":
+        return label or RAW_DIR_NAME
+    if key == "processed":
+        return label or PROCESSED_DIR_NAME
     return label or key
 
 
@@ -99,8 +103,8 @@ def _default_levels() -> List[Dict[str, Any]]:
         {"key": "session",    "enabled": True,  "label": "Session"},
         {"key": "recording",  "enabled": False, "label": "Recording"},
         {"key": "trial",      "enabled": False, "label": "Trial"},
-        {"key": "raw",        "enabled": False, "label": "raw"},
-        {"key": "processed",  "enabled": False, "label": "processed"},
+        {"key": "raw",        "enabled": False, "label": RAW_DIR_NAME},
+        {"key": "processed",  "enabled": False, "label": PROCESSED_DIR_NAME},
         {"key": "group",      "enabled": False, "label": "group"},
     ]
 
@@ -180,3 +184,49 @@ def enabled_level_keys(schema: Dict[str, Any], kind: str = "raw") -> List[str]:
             continue
         out.append(str(lvl.get("key", "")).strip().lower())
     return out
+
+
+# ── traversal helpers (used by the tabs to follow the schema) ─────────────
+
+# Metadata-field name produced by each variable level.
+META_KEY_FOR_LEVEL: Dict[str, str] = {
+    "experiment": "Experiment",
+    "subject":    "Subject",
+    "session":    "Session",
+    "recording":  "Recording",
+    "trial":      "Trial",
+}
+
+
+def enabled_levels(schema: Dict[str, Any], kind: str = "raw") -> List[Dict[str, Any]]:
+    """Return the enabled level dicts, in order."""
+    return [
+        lvl for lvl in schema.get(f"{kind}_levels", [])
+        if isinstance(lvl, dict) and lvl.get("enabled", False)
+    ]
+
+
+def sublevels(schema: Dict[str, Any], kind: str = "raw") -> List[Dict[str, Any]]:
+    """Enabled levels *below* the leading ``project`` level.
+
+    These define the folder nesting inside a project folder, in order. Marker
+    levels (raw/processed/group) keep their fixed folder name; variable levels
+    (experiment/subject/session/recording/trial) take their value from the data.
+    """
+    out: List[Dict[str, Any]] = []
+    for lvl in enabled_levels(schema, kind):
+        if str(lvl.get("key", "")).strip().lower() == "project":
+            continue
+        out.append(lvl)
+    return out
+
+
+def level_label(level: Dict[str, Any]) -> str:
+    key = str(level.get("key", "")).strip().lower()
+    return str(level.get("label", "")).strip() or (key.title() if key else "Level")
+
+
+def level_meta_key(level: Dict[str, Any]) -> str:
+    """Metadata field name for a variable level (e.g. subject -> 'Subject')."""
+    key = str(level.get("key", "")).strip().lower()
+    return META_KEY_FOR_LEVEL.get(key, key.title())

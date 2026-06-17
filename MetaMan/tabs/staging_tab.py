@@ -120,11 +120,7 @@ class StagingTab(QWidget):
         row_btn = QHBoxLayout()
         row_btn.addStretch(1)
         self.b_create = QPushButton("  Create linked recording  ")
-        self.b_create.setStyleSheet(
-            "QPushButton { background: #3ba55d; color: white; font-weight: 600; "
-            "padding: 8px 18px; border-radius: 6px; }"
-            "QPushButton:hover { background: #2d8b4e; }"
-        )
+        self.b_create.setObjectName("Success")
         self.b_create.clicked.connect(self._create_linked)
         row_btn.addWidget(self.b_create)
         self.b_open_folder = QPushButton("Open staging folder")
@@ -161,11 +157,7 @@ class StagingTab(QWidget):
         tbl_btns.addWidget(b_sync_sel)
 
         b_sync_all = QPushButton("Sync all pending")
-        b_sync_all.setStyleSheet(
-            "QPushButton { background: #5865f2; color: white; font-weight: 600; "
-            "padding: 5px 14px; border-radius: 6px; }"
-            "QPushButton:hover { background: #4752c4; }"
-        )
+        b_sync_all.setObjectName("Primary")
         b_sync_all.clicked.connect(self._sync_all_pending)
         tbl_btns.addWidget(b_sync_all)
 

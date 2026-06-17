@@ -15,10 +15,20 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
-from ..config import COPY_CHUNK_BYTES
+from ..config import COPY_CHUNK_BYTES, RAW_DIR_NAME, RAW_DIR_ALIASES
 
 STAGING_FOLDER = "staging"
 MANIFEST_FILE = "staging_manifest.json"
+
+
+def _server_raw_candidates() -> List[str]:
+    """Subfolder names that may hold projects under a server root, preferred
+    first: the standard ``rawData`` then legacy ``raw``/``rawdata``."""
+    out: List[str] = []
+    for name in [RAW_DIR_NAME, *RAW_DIR_ALIASES]:
+        if name and name not in out:
+            out.append(name)
+    return out
 
 # ── manifest I/O ────────────────────────────────────────────────────────
 
@@ -53,8 +63,7 @@ def list_server_projects(server_root: str) -> List[str]:
     if not server_root or not os.path.isdir(server_root):
         return []
     try:
-        raw = os.path.join(server_root, "raw")
-        base = raw if os.path.isdir(raw) else server_root
+        base = server_raw_root(server_root)
         return sorted(
             d for d in os.listdir(base)
             if os.path.isdir(os.path.join(base, d)) and d != STAGING_FOLDER
@@ -64,9 +73,13 @@ def list_server_projects(server_root: str) -> List[str]:
 
 
 def server_raw_root(server_root: str) -> str:
-    """Return ``server_root/raw`` if it exists, else *server_root*."""
-    raw = os.path.join(server_root, "raw")
-    return raw if os.path.isdir(raw) else server_root
+    """Return the raw-data subfolder of *server_root* (``rawData`` or legacy
+    ``raw``) if one exists, else *server_root* itself."""
+    for name in _server_raw_candidates():
+        cand = os.path.join(server_root, name)
+        if os.path.isdir(cand):
+            return cand
+    return server_root
 
 
 def list_server_experiments(server_root: str, project: str) -> List[str]:

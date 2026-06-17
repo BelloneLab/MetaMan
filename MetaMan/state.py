@@ -1,7 +1,16 @@
 import json
 import os
 from typing import Any, Dict, Optional
-from .config import SETTINGS_FILE, DEFAULT_DATA_ROOT, DEFAULT_RAW_ROOT, DEFAULT_PROCESSED_ROOT
+from .config import (
+    SETTINGS_FILE, DEFAULT_DATA_ROOT, DEFAULT_RAW_ROOT, DEFAULT_PROCESSED_ROOT,
+    RAW_DIR_NAME, PROCESSED_DIR_NAME, RAW_DIR_ALIASES, PROCESSED_DIR_ALIASES,
+)
+
+
+def _sanitize_folder_name(name: str) -> str:
+    bad = '<>:"/\\|?*'
+    return "".join(ch for ch in str(name or "").strip() if ch not in bad).strip()
+
 
 class AppSettings:
     def __init__(self):
@@ -9,6 +18,8 @@ class AppSettings:
             "data_root": DEFAULT_DATA_ROOT,
             "raw_root": DEFAULT_RAW_ROOT,
             "processed_root": DEFAULT_PROCESSED_ROOT,
+            "raw_dir_name": RAW_DIR_NAME,            # user-configurable folder name
+            "processed_dir_name": PROCESSED_DIR_NAME,  # user-configurable folder name
             "last_opened_project": "",
             "last_opened_experiment": "",
             "last_opened_session_path": "",
@@ -40,18 +51,67 @@ class AppSettings:
             return os.path.exists(drive + os.sep)
         return True
 
+    # ── configurable folder names ─────────────────────────────────────
+    @property
+    def raw_dir_name(self) -> str:
+        return _sanitize_folder_name(self._data.get("raw_dir_name")) or RAW_DIR_NAME
+
+    @property
+    def processed_dir_name(self) -> str:
+        return _sanitize_folder_name(self._data.get("processed_dir_name")) or PROCESSED_DIR_NAME
+
+    def _raw_markers(self) -> set:
+        """Folder basenames (lowercase) recognised as a raw root."""
+        return set(RAW_DIR_ALIASES) | {self.raw_dir_name.lower()}
+
+    def _processed_markers(self) -> set:
+        return set(PROCESSED_DIR_ALIASES) | {self.processed_dir_name.lower()}
+
+    def _strip_root_marker(self, path: str) -> str:
+        """If *path* points at a raw/processed folder, return its parent.
+
+        Lets users pick either ``B:/NPX`` or ``B:/NPX/rawData`` as the data root
+        and end up with the same result: projects are scanned from
+        ``<data_root>/<raw_dir_name>``.
+        """
+        p = str(path or "").strip()
+        if not p:
+            return p
+        base = os.path.basename(os.path.normpath(p)).lower()
+        if base in (self._raw_markers() | self._processed_markers()):
+            parent = os.path.dirname(os.path.normpath(p))
+            if parent:
+                return parent
+        return p
+
+    def set_folder_names(self, raw_name: str, processed_name: str):
+        """Set the raw/processed folder names and recompute the roots."""
+        raw_name = _sanitize_folder_name(raw_name) or RAW_DIR_NAME
+        processed_name = _sanitize_folder_name(processed_name) or PROCESSED_DIR_NAME
+        self._data["raw_dir_name"] = raw_name
+        self._data["processed_dir_name"] = processed_name
+        data_root = self.data_root
+        self._data["raw_root"] = os.path.join(data_root, raw_name)
+        self._data["processed_root"] = os.path.join(data_root, processed_name)
+        self.save()
+
     def _coerce_data_root(self) -> str:
         data_root = str(self._data.get("data_root") or "").strip()
         raw_root = str(self._data.get("raw_root") or "").strip()
         proc_root = str(self._data.get("processed_root") or "").strip()
 
         if not data_root:
-            if os.path.basename(raw_root).lower() in ("raw", "rawdata"):
+            if os.path.basename(raw_root).lower() in self._raw_markers():
                 data_root = os.path.dirname(raw_root)
-            elif os.path.basename(proc_root).lower() in ("processed", "processeddata"):
+            elif os.path.basename(proc_root).lower() in self._processed_markers():
                 data_root = os.path.dirname(proc_root)
             else:
                 data_root = DEFAULT_DATA_ROOT
+
+        # If the data root itself points at a raw/processed folder, step up so
+        # projects living directly inside it are discovered. This repairs older
+        # settings that stored e.g. "B:/NPX/rawData" as the data root.
+        data_root = self._strip_root_marker(data_root)
 
         if not self._path_drive_is_available(data_root):
             data_root = self._fallback_data_root()
@@ -64,22 +124,22 @@ class AppSettings:
             # Ensure folder-style defaults and coerce invalid legacy roots.
             data_root = self._coerce_data_root()
             self._data["data_root"] = data_root
-            self._data["raw_root"] = os.path.join(data_root, "raw")
-            self._data["processed_root"] = os.path.join(data_root, "processed")
+            self._data["raw_root"] = os.path.join(data_root, self.raw_dir_name)
+            self._data["processed_root"] = os.path.join(data_root, self.processed_dir_name)
         except Exception:
             pass
 
     def ensure_storage_roots(self):
         data_root = self._coerce_data_root()
-        raw_root = os.path.join(data_root, "raw")
-        proc_root = os.path.join(data_root, "processed")
+        raw_root = os.path.join(data_root, self.raw_dir_name)
+        proc_root = os.path.join(data_root, self.processed_dir_name)
         try:
             os.makedirs(raw_root, exist_ok=True)
             os.makedirs(proc_root, exist_ok=True)
         except Exception:
             data_root = self._fallback_data_root()
-            raw_root = os.path.join(data_root, "raw")
-            proc_root = os.path.join(data_root, "processed")
+            raw_root = os.path.join(data_root, self.raw_dir_name)
+            proc_root = os.path.join(data_root, self.processed_dir_name)
             os.makedirs(raw_root, exist_ok=True)
             os.makedirs(proc_root, exist_ok=True)
         self._data["data_root"] = data_root
@@ -95,23 +155,23 @@ class AppSettings:
 
     @property
     def raw_root(self) -> str:
-        return self._data.get("raw_root") or os.path.join(self.data_root, "raw")
+        return self._data.get("raw_root") or os.path.join(self.data_root, self.raw_dir_name)
 
     @raw_root.setter
     def raw_root(self, v: str):
         self._data["raw_root"] = v
-        if os.path.basename(v).lower() in ("raw", "rawdata"):
+        if os.path.basename(v).lower() in self._raw_markers():
             self._data["data_root"] = os.path.dirname(v)
         self.save()
 
     @property
     def processed_root(self) -> str:
-        return self._data.get("processed_root") or os.path.join(self.data_root, "processed")
+        return self._data.get("processed_root") or os.path.join(self.data_root, self.processed_dir_name)
 
     @processed_root.setter
     def processed_root(self, v: str):
         self._data["processed_root"] = v
-        if os.path.basename(v).lower() in ("processed", "processeddata"):
+        if os.path.basename(v).lower() in self._processed_markers():
             self._data["data_root"] = os.path.dirname(v)
         self.save()
 
@@ -121,13 +181,39 @@ class AppSettings:
 
     @data_root.setter
     def data_root(self, v: str):
+        v = self._strip_root_marker(v)
         self._data["data_root"] = v
-        self._data["raw_root"] = os.path.join(v, "raw")
-        self._data["processed_root"] = os.path.join(v, "processed")
+        self._data["raw_root"] = os.path.join(v, self.raw_dir_name)
+        self._data["processed_root"] = os.path.join(v, self.processed_dir_name)
         self.save()
 
+    def _heal_server_root(self, path: str) -> str:
+        """Map a stored server root whose last folder is a legacy raw/processed
+        name to the renamed folder when only the new one exists on disk.
+
+        e.g. ``.../PROJECTS/raw`` -> ``.../PROJECTS/rawData`` after a rename.
+        """
+        p = str(path or "").strip()
+        if not p or os.path.isdir(p):
+            return p
+        norm = os.path.normpath(p)
+        base = os.path.basename(norm).lower()
+        parent = os.path.dirname(norm)
+        if not parent:
+            return p
+        if base in self._raw_markers():
+            cand = os.path.join(parent, self.raw_dir_name)
+            if os.path.isdir(cand):
+                return cand
+        if base in self._processed_markers():
+            cand = os.path.join(parent, self.processed_dir_name)
+            if os.path.isdir(cand):
+                return cand
+        return p
+
     def get_server_root_for_project(self, project: str) -> str:
-        return (self._data.get("server_roots_by_project") or {}).get(project, "")
+        raw = (self._data.get("server_roots_by_project") or {}).get(project, "")
+        return self._heal_server_root(raw)
 
     def put_server_root_for_project(self, project: str, server_root: str):
         d = self._data.setdefault("server_roots_by_project", {})
@@ -284,6 +370,14 @@ class AppSettings:
         }
         self.save()
 
+    def get_metadata_template(self) -> Dict[str, Any]:
+        raw = self._data.get("metadata_template") or {}
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def put_metadata_template(self, template: Dict[str, Any]):
+        self._data["metadata_template"] = dict(template or {})
+        self.save()
+
     def get_structure_schema(self) -> Dict[str, Any]:
         raw = self._data.get("structure_schema") or {}
         return dict(raw) if isinstance(raw, dict) else {}
@@ -296,6 +390,18 @@ class AppSettings:
         schemas = self._data.get("structure_schemas_by_project") or {}
         raw = schemas.get(project, {}) if isinstance(schemas, dict) else {}
         return dict(raw) if isinstance(raw, dict) else {}
+
+    def resolve_structure_schema(self, project: str = "") -> Dict[str, Any]:
+        """Return the normalized schema that applies to *project*: its own
+        per-project schema if set, otherwise the default (all-projects) schema.
+        """
+        from .services.structure_schema import (
+            normalize_structure_schema, default_structure_schema,
+        )
+        raw = self.get_project_structure_schema(project) if project else {}
+        if not raw:
+            raw = self.get_structure_schema()
+        return normalize_structure_schema(raw or default_structure_schema())
 
     def put_project_structure_schema(self, project: str, schema: Dict[str, Any]):
         d = self._data.setdefault("structure_schemas_by_project", {})

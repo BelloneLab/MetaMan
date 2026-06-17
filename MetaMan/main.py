@@ -3,8 +3,17 @@ import sys
 from datetime import datetime
 from time import time
 
+# Allow running this file directly (python main.py) as well as via the package
+# entry point (python run_app.py / python -m MetaMan.main). When executed as a
+# loose script there is no parent package, so relative imports below would fail.
+if __package__ in (None, ""):
+    _pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _pkg_root not in sys.path:
+        sys.path.insert(0, _pkg_root)
+    __package__ = "MetaMan"
+
 from PySide6.QtCore import QTime, QTimer, Qt
-from PySide6.QtGui import QAction, QIcon, QPixmap
+from PySide6.QtGui import QAction, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
@@ -19,10 +28,11 @@ from .tabs.navigation_tab import NavigationTab
 from .tabs.recording_tab import RecordingTab
 from .tabs.preprocessing_tab import PreprocessingTab
 from .tabs.data_reorganizer_tab import DataReorganizerTab
-from .tabs.staging_tab import StagingTab
+from .tabs.transfer_tab import TransferTab
+from .project_bar import ProjectContextBar
 from .services.server_sync import sync_project_to_server
 from .services.staging_service import load_manifest, sync_pending
-from .side_panel import SidePanelLayout
+from .theme import STYLESHEET, FONT_FAMILY
 from .services.search_service import search_in_project
 from .io_ops import list_experiments, list_projects, load_session_metadata, save_session_triplet
 from .utils import run_in_thread
@@ -68,6 +78,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.resize(*WINDOW_GEOMETRY)
+        self.setMinimumSize(1100, 720)
         logo_path = _resolve_logo_path()
         if logo_path:
             icon = QIcon(logo_path)
@@ -85,148 +96,90 @@ class MainWindow(QMainWindow):
         cw = QWidget()
         self.setCentralWidget(cw)
         root = QVBoxLayout(cw)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # Global active-project bar drives every tab.
+        self.project_bar = ProjectContextBar(self.state)
+        self.project_bar.project_selected.connect(self._activate_project_everywhere)
+        self.project_bar.design_structure_requested.connect(self._menu_design_structure)
+        self.project_bar.set_data_root_requested.connect(self._menu_set_data_root)
+        root.addWidget(self.project_bar)
 
         self.tabs = QTabWidget()
-        self.nav_tab = NavigationTab(self.state, on_load_session=self._load_session_everywhere)
+        self.nav_tab = NavigationTab(
+            self.state,
+            on_load_session=self._load_session_everywhere,
+            on_activate_project=self._activate_project_everywhere,
+        )
         self.rec_tab = RecordingTab(self.state)
         self.pre_tab = PreprocessingTab(self.state)
-        self.staging_tab = StagingTab(self.state)
         self.reorg_tab = DataReorganizerTab(self.state)
-        self.tabs.addTab(self.nav_tab, "Navigation")
-        self.tabs.addTab(self.rec_tab, "Recording")
-        self.tabs.addTab(self.pre_tab, "Preprocessing")
-        self.tabs.addTab(self.staging_tab, "Staging")
-        self.tabs.addTab(self.reorg_tab, "Data reorganizer")
+        # Transfer hosts Backup + Staging + Schedule and needs nav_tab to exist.
+        self.transfer_tab = TransferTab(self.state, self)
+        self.staging_tab = self.transfer_tab.staging  # back-compat alias
+
+        self.tabs.addTab(self.nav_tab, "Browse")
+        self.tabs.addTab(self.rec_tab, "Record")
+        self.tabs.addTab(self.pre_tab, "Process")
+        self.tabs.addTab(self.transfer_tab, "Transfer")
+        self.tabs.addTab(self.reorg_tab, "Import")
         root.addWidget(self.tabs, 1)
 
-        bar = QHBoxLayout()
-        b_copy = QPushButton("Backup project...")
-        b_copy.clicked.connect(self._backup_project_now)
-        bar.addWidget(b_copy)
-
-        b_sched = QPushButton("Schedule backup...")
-        b_sched.clicked.connect(self._schedule_backup)
-        bar.addWidget(b_sched)
-
-        b_search = QPushButton("Search...")
-        b_search.clicked.connect(self._search)
-        bar.addWidget(b_search)
-
-        b_animal = QPushButton("Generate subject summary CSV...")
-        b_animal.clicked.connect(self._animal_summary)
-        bar.addWidget(b_animal)
-
-        bar.addStretch(1)
+        # Status bar with a permanent active-project indicator.
         self.lbl_status = QLabel("")
-        bar.addWidget(self.lbl_status)
-        root.addLayout(bar)
+        self.statusBar().addWidget(self.lbl_status, 1)
+        self.lbl_active_project = QLabel("")
+        self.lbl_active_project.setStyleSheet("font-weight: 600; padding-right: 8px;")
+        self.statusBar().addPermanentWidget(self.lbl_active_project)
+        self._update_active_project_indicator()
 
     def _build_menu(self):
-        menu_file = self.menuBar().addMenu("&File")
+        bar = self.menuBar()
 
-        act_new_project = QAction("New Project...", self)
-        act_new_project.triggered.connect(self._menu_new_project)
-        menu_file.addAction(act_new_project)
+        def add(menu, label, slot):
+            act = QAction(label, self)
+            act.triggered.connect(slot)
+            menu.addAction(act)
+            return act
 
-        act_add_experiment = QAction("Add Experiment...", self)
-        act_add_experiment.triggered.connect(self._menu_add_experiment)
-        menu_file.addAction(act_add_experiment)
-
+        # File
+        menu_file = bar.addMenu("&File")
+        add(menu_file, "New Project…", self._menu_new_project)
+        add(menu_file, "Open Local Project…", lambda: self.project_bar._load_local())
+        add(menu_file, "Open Server Project…", lambda: self.project_bar._load_server())
         menu_file.addSeparator()
-
-        act_set_root = QAction("Set Data Root...", self)
-        act_set_root.triggered.connect(self._menu_set_data_root)
-        menu_file.addAction(act_set_root)
-
-        act_structure = QAction("\U0001f9e9  Design Data Structure...", self)
-        act_structure.triggered.connect(self._menu_design_structure)
-        menu_file.addAction(act_structure)
-
-        act_refresh = QAction("Refresh All Lists", self)
-        act_refresh.triggered.connect(self._refresh_everything)
-        menu_file.addAction(act_refresh)
-
+        add(menu_file, "Refresh All Lists", self._refresh_everything)
         menu_file.addSeparator()
+        add(menu_file, "Exit", self.close)
 
-        act_backup_now = QAction("Backup Now...", self)
-        act_backup_now.triggered.connect(self._backup_project_now)
-        menu_file.addAction(act_backup_now)
+        # Project (acts on the active project)
+        menu_proj = bar.addMenu("&Project")
+        add(menu_proj, "Add Experiment…", self._menu_add_experiment)
+        add(menu_proj, "\U0001f9e9  Design Data Structure…", self._menu_design_structure)
+        add(menu_proj, "Open Project Folder", self._menu_open_project_folder)
+        menu_proj.addSeparator()
+        add(menu_proj, "Search in Project…", self._search)
+        add(menu_proj, "Generate Subject Summary CSV…", self._animal_summary)
 
-        act_backup_sched = QAction("Schedule Backup...", self)
-        act_backup_sched.triggered.connect(self._schedule_backup)
-        menu_file.addAction(act_backup_sched)
+        # Settings
+        menu_set = bar.addMenu("&Settings")
+        add(menu_set, "Set Data Root…", self._menu_set_data_root)
+        add(menu_set, "Folder Names (rawData / processedData)…", self._menu_folder_names)
 
-        menu_file.addSeparator()
+        # Transfer
+        menu_tr = bar.addMenu("&Transfer")
+        add(menu_tr, "Backup Now…", self._backup_project_now)
+        add(menu_tr, "Schedule Backup…", self._schedule_backup)
+        menu_tr.addSeparator()
+        add(menu_tr, "Open Transfer Tab", lambda: self.tabs.setCurrentWidget(self.transfer_tab))
 
-        act_exit = QAction("Exit", self)
-        act_exit.triggered.connect(self.close)
-        menu_file.addAction(act_exit)
+        # Help
+        menu_help = bar.addMenu("&Help")
+        add(menu_help, "About MetaMan", self._menu_about)
 
     def _apply_visual_style(self):
-        self.setStyleSheet(
-            SidePanelLayout.style_sheet() + """
-            QWidget {
-                font-size: 11px;
-            }
-            QTabWidget::pane {
-                border: 1px solid #c9ced6;
-                border-radius: 6px;
-                background: #fbfcfe;
-            }
-            QTabBar::tab {
-                background: #ebeff5;
-                border: 1px solid #c9ced6;
-                border-bottom: none;
-                padding: 7px 12px;
-                margin-right: 2px;
-                border-top-left-radius: 6px;
-                border-top-right-radius: 6px;
-            }
-            QTabBar::tab:selected {
-                background: #ffffff;
-                color: #162133;
-                font-weight: 600;
-            }
-            QGroupBox {
-                border: 1px solid #d2d8e1;
-                border-radius: 6px;
-                margin-top: 8px;
-                padding-top: 8px;
-                background: #ffffff;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 4px 0 4px;
-                color: #1b2b47;
-                font-weight: 600;
-            }
-            QPushButton {
-                background: #f2f5fa;
-                border: 1px solid #b8c3d3;
-                border-radius: 6px;
-                padding: 5px 10px;
-                min-height: 22px;
-            }
-            QPushButton:hover {
-                background: #e6edf8;
-            }
-            QPushButton:pressed {
-                background: #dce6f5;
-            }
-            QLineEdit, QComboBox, QTimeEdit, QTextEdit, QTableWidget {
-                border: 1px solid #bcc7d6;
-                border-radius: 5px;
-                background: #ffffff;
-            }
-            QHeaderView::section {
-                background: #edf2f8;
-                border: 1px solid #d0d8e4;
-                padding: 4px;
-                font-weight: 600;
-            }
-            """
-        )
+        self.setStyleSheet(STYLESHEET)
 
     def _init_backup_scheduler(self):
         self._backup_timer = QTimer(self)
@@ -239,11 +192,90 @@ class MainWindow(QMainWindow):
         self.rec_tab.load_session(session_path)
         self.pre_tab._load_from_session(session_path)
 
+    def _activate_project_everywhere(self, project_name: str):
+        """Make *project_name* the active project across every tab. Selecting a
+        project in the bar (or a node in Browse) flows through here so Record,
+        Process and Transfer all follow the same project."""
+        project_name = (project_name or "").strip()
+        if not project_name:
+            return
+        # Preserve a freshly-loaded server project; otherwise treat as a local
+        # project under the raw root.
+        loaded = self.state.settings.get_loaded_project()
+        if loaded.get("name") != project_name:
+            project_dir = self._project_dir(project_name)
+            self.state.settings.put_loaded_project(project_name, project_dir, "local", project_dir)
+        self.state.set_current(project=project_name, experiment="", animal="", session="", session_path="")
+
+        for refresh in (
+            lambda: self.project_bar.refresh(active=project_name),
+            lambda: self.nav_tab.select_project(project_name),
+            self.rec_tab._refresh_from_project,
+            self.pre_tab._refresh_from_project,
+            self.transfer_tab.refresh,
+        ):
+            try:
+                refresh()
+            except Exception:
+                pass
+        self._update_active_project_indicator()
+        self.lbl_status.setText(f"Active project: {project_name}")
+
+    def _update_active_project_indicator(self):
+        name = (self.state.current_project
+                or self.state.settings.get_loaded_project().get("name", "")).strip()
+        self.lbl_active_project.setText(f"Project: {name}" if name else "No project loaded")
+
+    def _menu_open_project_folder(self):
+        project = self.state.current_project
+        if not project:
+            QMessageBox.warning(self, "No project", "Select a project first.")
+            return
+        target = self._resolve_project_dir(project)
+        if not os.path.isdir(target):
+            QMessageBox.critical(self, "Not found", f"Project folder not found:\n{target}")
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(target)
+            elif sys.platform == "darwin":
+                import subprocess; subprocess.run(["open", target])
+            else:
+                import subprocess; subprocess.run(["xdg-open", target])
+        except Exception as e:
+            QMessageBox.critical(self, "Open error", f"Failed to open:\n{target}\n\n{e}")
+
+    def _menu_about(self):
+        QMessageBox.information(
+            self, "About MetaMan",
+            "MetaMan — neuroscience data organization.\n\n"
+            "Workflow: Browse · Record · Process · Transfer · Import.\n"
+            "Each project's folder structure is configurable in "
+            "Project ▸ Design Data Structure.",
+        )
+
     def _project_dir(self, project: str) -> str:
         return os.path.join(self.state.settings.raw_root, project)
 
+    def _resolve_project_dir(self, project: str) -> str:
+        """Return the local folder for *project* (always ``<raw_root>/<project>``).
+
+        The loaded project's saved destination is only trusted when it really
+        points at the project folder (its basename matches the project name).
+        Otherwise we ignore it, so a destination that was mistakenly set to the
+        raw root (e.g. ``B:/NPX/rawData``) can never be used as the backup
+        source. That mistake is what produced the stray ``server/rawData/...``
+        tree on the server.
+        """
+        loaded = self.state.settings.get_loaded_project()
+        dest = str(loaded.get("destination_path") or "").strip()
+        if loaded.get("name") == project and dest:
+            if os.path.basename(os.path.normpath(dest)).lower() == project.strip().lower():
+                return dest
+        return self._project_dir(project)
+
     def _experiment_dir(self, project: str, experiment: str) -> str:
-        return os.path.join(self.state.settings.raw_root, project, experiment)
+        return os.path.join(self._resolve_project_dir(project), experiment)
 
     def _backup_job_key(self, project: str, experiment: str = "", destination_kind: str = "server") -> str:
         return f"{project}::{experiment or '*'}::{destination_kind}"
@@ -294,21 +326,31 @@ class MainWindow(QMainWindow):
         log(f"[staging] Auto-syncing {len(entry_ids)} pending recording(s) for {project}.")
         sync_pending(self.state.settings.data_root, log, entry_ids=entry_ids)
 
-    def _start_backup_copy(self, project: str, experiment: str, destination_root: str, destination_kind: str, scheduled: bool):
-        source_dir = self._experiment_dir(project, experiment) if experiment else self._project_dir(project)
+    def _start_backup_copy(self, project: str, experiment: str, destination_root: str, destination_kind: str, scheduled: bool, log=None):
+        sink = log or self.rec_tab.logger.log
+        source_dir = self._experiment_dir(project, experiment) if experiment else self._resolve_project_dir(project)
         if not os.path.isdir(source_dir):
-            self.rec_tab.logger.log(f"[backup] Source folder not found: {source_dir}")
+            sink(f"[backup] Source folder not found: {source_dir}")
             return
-        destination_scope_root = os.path.join(destination_root, project) if experiment else destination_root
+        # Server mirrors local: <server_root>/<project>[/<experiment>]. The
+        # destination folder name is explicit so the source basename can never
+        # leak in (which previously created server/rawData instead of project).
+        if experiment:
+            dest_parent = os.path.join(destination_root, project)
+            dest_name = experiment
+        else:
+            dest_parent = destination_root
+            dest_name = project
+        destination_scope_root = os.path.join(dest_parent, dest_name)
 
         job_key = self._backup_job_key(project, experiment, destination_kind=destination_kind)
         if job_key in self._backup_jobs_in_progress:
             scope = f"{project}/{experiment}" if experiment else project
-            self.rec_tab.logger.log(f"[backup] Backup already in progress for scope: {scope} ({destination_kind})")
+            sink(f"[backup] Backup already in progress for scope: {scope} ({destination_kind})")
             return
 
         def log(s: str):
-            self.rec_tab.logger.log(s)
+            sink(s)
 
         scope = f"{project}/{experiment}" if experiment else project
         mode = "scheduled backup" if scheduled else "manual backup"
@@ -326,7 +368,7 @@ class MainWindow(QMainWindow):
                         self._sync_pending_staging_for_project(project, log)
                     except Exception as exc:
                         log(f"[warning] Staging auto-sync failed: {exc}")
-                sync_project_to_server(source_dir, destination_scope_root, log)
+                sync_project_to_server(source_dir, dest_parent, log, dest_name=dest_name)
                 dt = max(time() - started, 1e-6)
                 log(f"[{mode}/{destination_label}] Finished in {dt:.1f}s.")
                 if not experiment:
@@ -345,14 +387,9 @@ class MainWindow(QMainWindow):
         self._backup_project_now()
 
     def _backup_project_now(self):
-        proj = self.state.current_project
-        if not proj:
-            QMessageBox.warning(self, "No project", "Select or load a session first.")
-            return
-
-        project_dir = self._project_dir(proj)
-        if not os.path.isdir(project_dir):
-            QMessageBox.critical(self, "Missing", f"Project folder not found:\n{project_dir}")
+        projects = list_projects(self.state.settings.raw_root)
+        if not projects:
+            QMessageBox.warning(self, "No projects", "No projects found in the data root.")
             return
 
         dlg = QDialog(self)
@@ -360,11 +397,17 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(dlg)
         form = QFormLayout()
 
+        # Flexible project picker (defaults to the current project if any).
+        cb_project = QComboBox()
+        cb_project.addItems(projects)
+        if self.state.current_project in projects:
+            cb_project.setCurrentText(self.state.current_project)
+
         cb_destination = QComboBox()
         cb_destination.addItems(["Server", "External HDD", "Both"])
 
         row_server = QHBoxLayout()
-        ed_server = QLineEdit(self.state.settings.get_server_root_for_project(proj))
+        ed_server = QLineEdit()
         b_server = QPushButton("Browse...")
         row_server.addWidget(ed_server, 1)
         row_server.addWidget(b_server)
@@ -372,7 +415,7 @@ class MainWindow(QMainWindow):
         row_server_w.setLayout(row_server)
 
         row_hdd = QHBoxLayout()
-        ed_hdd = QLineEdit(self.state.settings.get_hdd_root_for_project(proj))
+        ed_hdd = QLineEdit()
         b_hdd = QPushButton("Browse...")
         row_hdd.addWidget(ed_hdd, 1)
         row_hdd.addWidget(b_hdd)
@@ -383,12 +426,24 @@ class MainWindow(QMainWindow):
         if self.state.current_experiment:
             chk_current_experiment.setText(f"Backup only current experiment ({self.state.current_experiment})")
 
-        form.addRow("Project:", QLabel(proj))
+        form.addRow("Project:", cb_project)
         form.addRow("Destination:", cb_destination)
         form.addRow("Server root:", row_server_w)
         form.addRow("External HDD root:", row_hdd_w)
         form.addRow("", chk_current_experiment)
         lay.addLayout(form)
+
+        def load_roots_for_project():
+            p = cb_project.currentText().strip()
+            ed_server.setText(self.state.settings.get_server_root_for_project(p))
+            ed_hdd.setText(self.state.settings.get_hdd_root_for_project(p))
+            has_cur_exp = bool(self.state.current_experiment) and p == self.state.current_project
+            chk_current_experiment.setEnabled(has_cur_exp)
+            if not has_cur_exp:
+                chk_current_experiment.setChecked(False)
+
+        load_roots_for_project()
+        cb_project.currentIndexChanged.connect(lambda _=0: load_roots_for_project())
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         lay.addWidget(btns)
@@ -417,6 +472,14 @@ class MainWindow(QMainWindow):
             row_hdd_w.setEnabled(mode in ("hdd", "both"))
 
         def start_manual_backup():
+            proj = cb_project.currentText().strip()
+            if not proj:
+                QMessageBox.warning(dlg, "Project", "Choose a project.")
+                return
+            project_dir = self._resolve_project_dir(proj)
+            if not os.path.isdir(project_dir):
+                QMessageBox.critical(dlg, "Missing", f"Project folder not found:\n{project_dir}")
+                return
             mode = destination_mode()
             destinations = []
             server_dir = ed_server.text().strip()
@@ -435,7 +498,8 @@ class MainWindow(QMainWindow):
                 self.state.settings.put_hdd_root_for_project(proj, hdd_dir)
 
             experiment = ""
-            if chk_current_experiment.isChecked() and self.state.current_experiment:
+            if (chk_current_experiment.isChecked() and self.state.current_experiment
+                    and proj == self.state.current_project):
                 experiment = self.state.current_experiment
 
             for kind, dest_root in destinations:
@@ -508,7 +572,7 @@ class MainWindow(QMainWindow):
             if not destinations:
                 continue
 
-            project_dir = self._project_dir(project)
+            project_dir = self._resolve_project_dir(project)
             if not os.path.isdir(project_dir):
                 self._warn_schedule_once(today, project, f"project folder not found: {project_dir}")
                 continue
@@ -771,7 +835,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
-            self.pre_tab._refresh_lists()
+            self.pre_tab._refresh_from_project()
         except Exception:
             pass
         try:
@@ -780,6 +844,18 @@ class MainWindow(QMainWindow):
             pass
         try:
             self.reorg_tab._refresh_project_list()
+        except Exception:
+            pass
+        try:
+            self.transfer_tab.refresh()
+        except Exception:
+            pass
+        try:
+            self.project_bar.refresh()
+        except Exception:
+            pass
+        try:
+            self._update_active_project_indicator()
         except Exception:
             pass
 
@@ -814,31 +890,130 @@ class MainWindow(QMainWindow):
         self._refresh_everything()
         self.lbl_status.setText(f"Data root set: {self.state.settings.data_root}")
 
+    def _menu_folder_names(self):
+        """Let the user choose the raw/processed folder names (default
+        rawData / processedData). Optionally renames the existing folders."""
+        s = self.state.settings
+        data_root = s.data_root
+        cur_raw = s.raw_dir_name
+        cur_proc = s.processed_dir_name
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Folder Names")
+        lay = QVBoxLayout(dlg)
+
+        info = QLabel(
+            "Choose the folder names used for raw and processed data. These sit "
+            "directly under the data root and hold your projects.\n"
+            "Default is rawData / processedData; other users can pick their own."
+        )
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        form = QFormLayout()
+        ed_raw = QLineEdit(cur_raw)
+        ed_proc = QLineEdit(cur_proc)
+        form.addRow("Raw folder name:", ed_raw)
+        form.addRow("Processed folder name:", ed_proc)
+        lay.addLayout(form)
+
+        lbl_preview = QLabel()
+        lbl_preview.setWordWrap(True)
+        lbl_preview.setStyleSheet("color:#a79fbb; padding:6px; background:#1b1a24; border:1px solid #3a3548; border-radius:6px;")
+        lay.addWidget(lbl_preview)
+
+        chk_rename = QCheckBox("Also rename the existing folders on disk (when the new name is free)")
+        chk_rename.setChecked(True)
+        lay.addWidget(chk_rename)
+
+        def refresh_preview():
+            r = ed_raw.text().strip() or cur_raw
+            p = ed_proc.text().strip() or cur_proc
+            lbl_preview.setText(
+                f"{data_root}\\{r}\\<project>\\<experiment>\\...\n"
+                f"{data_root}\\{p}\\<project>\\<experiment>\\..."
+            )
+        ed_raw.textChanged.connect(lambda _=0: refresh_preview())
+        ed_proc.textChanged.connect(lambda _=0: refresh_preview())
+        refresh_preview()
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        new_raw = ed_raw.text().strip() or cur_raw
+        new_proc = ed_proc.text().strip() or cur_proc
+        if new_raw == cur_raw and new_proc == cur_proc:
+            return
+
+        if chk_rename.isChecked():
+            for old_name, new_name in ((cur_raw, new_raw), (cur_proc, new_proc)):
+                if old_name == new_name:
+                    continue
+                old_dir = os.path.join(data_root, old_name)
+                new_dir = os.path.join(data_root, new_name)
+                if os.path.isdir(old_dir) and not os.path.exists(new_dir):
+                    try:
+                        os.rename(old_dir, new_dir)
+                    except Exception as e:
+                        QMessageBox.warning(
+                            self, "Rename failed",
+                            f"Could not rename:\n{old_dir}\n->\n{new_dir}\n\n{e}\n\n"
+                            "The name was still updated; move the data manually if needed."
+                        )
+
+        self.state.settings.set_folder_names(new_raw, new_proc)
+        self.state.settings.ensure_storage_roots()
+        try:
+            self.nav_tab.ed_root.setText(self.state.settings.data_root)
+        except Exception:
+            pass
+        try:
+            self.pre_tab.ed_data_root.setText(self.state.settings.data_root)
+            self.pre_tab.ed_proc_root.setText(self.state.settings.processed_root)
+        except Exception:
+            pass
+        try:
+            self.reorg_tab.ed_target_raw.setText(self.state.settings.raw_root)
+            self.reorg_tab.ed_target_proc.setText(self.state.settings.processed_root)
+        except Exception:
+            pass
+        self._refresh_everything()
+        self.lbl_status.setText(
+            f"Folder names set: {new_raw} / {new_proc}"
+        )
+
     def _menu_design_structure(self):
         project = self.state.current_project
-        if project:
-            schema = self.state.settings.get_project_structure_schema(project)
-            if not schema:
-                schema = self.state.settings.get_structure_schema()
-            if not schema:
-                schema = default_structure_schema()
-        else:
-            schema = self.state.settings.get_structure_schema()
-            if not schema:
-                schema = default_structure_schema()
 
-        schema = normalize_structure_schema(schema)
-        dlg = StructureDesignerDialog(schema, project_name=project, parent=self)
+        default_schema = normalize_structure_schema(
+            self.state.settings.get_structure_schema() or default_structure_schema()
+        )
+        project_schema = None
+        if project:
+            raw_proj = self.state.settings.get_project_structure_schema(project)
+            project_schema = normalize_structure_schema(raw_proj) if raw_proj else None
+
+        dlg = StructureDesignerDialog(
+            default_schema=default_schema,
+            project_schema=project_schema,
+            project_name=project,
+            parent=self,
+        )
         if dlg.exec() != QDialog.Accepted:
             return
 
         result = dlg.schema()
-        if project:
+        if dlg.selected_scope() == "project" and project:
             self.state.settings.put_project_structure_schema(project, result)
             self.lbl_status.setText(f"Structure saved for project: {project}")
         else:
             self.state.settings.put_structure_schema(result)
-            self.lbl_status.setText("Default structure schema saved.")
+            self.lbl_status.setText("Default structure saved (applies to all projects).")
 
     def _menu_new_project(self):
         name, ok = QInputDialog.getText(self, "New Project", "Project name:")
@@ -918,36 +1093,32 @@ class MainWindow(QMainWindow):
 
     def _animal_summary(self):
         proj = self.state.current_project
-        exp = self.state.current_experiment
         subject = self.state.current_animal
-        if not (proj and exp and subject):
-            QMessageBox.warning(self, "Choose subject", "Select a subject in Navigation first.")
+        if not (proj and subject):
+            QMessageBox.warning(self, "Choose subject", "Select a subject in Browse first.")
             return
 
-        rows = []
-        import json
+        import os.path as _osp
         import pandas as pd
 
-        subject_dir = os.path.join(self.state.settings.raw_root, proj, exp, subject)
-        for sess in sorted([d for d in os.listdir(subject_dir) if os.path.isdir(os.path.join(subject_dir, d))]):
-            smeta = os.path.join(subject_dir, sess, "metadata.json")
-            if os.path.exists(smeta):
-                try:
-                    data = json.loads(open(smeta, "r", encoding="utf-8").read())
-                    row = {
-                        "Project": proj,
-                        "Experiment": exp,
-                        "Subject": subject,
-                        "Session": sess,
-                        "DateTime": data.get("DateTime", ""),
-                        "Recording": data.get("Recording", ""),
-                        "Experimenter": data.get("Experimenter", ""),
-                        "Condition": data.get("Condition", ""),
-                        "Comments": data.get("Comments", ""),
-                    }
-                    rows.append(row)
-                except Exception:
-                    pass
+        # Schema-aware: walk every session under the project and keep this
+        # subject's, whatever the nesting order (subject-before-experiment etc.).
+        rows = []
+        proj_dir = self._project_dir(proj)
+        for values, sdir, meta in self.nav_tab._iter_sessions_under(proj, proj_dir, 0):
+            if values.get("subject") != subject:
+                continue
+            rows.append({
+                "Project": proj,
+                "Experiment": values.get("experiment", meta.get("Experiment", "")),
+                "Subject": subject,
+                "Session": values.get("session", _osp.basename(sdir)),
+                "DateTime": meta.get("DateTime", ""),
+                "Recording": meta.get("Recording", ""),
+                "Experimenter": meta.get("Experimenter", ""),
+                "Condition": meta.get("Condition", ""),
+                "Comments": meta.get("Comments", ""),
+            })
 
         if not rows:
             QMessageBox.information(self, "No data", "No metadata found for this subject.")
@@ -969,6 +1140,9 @@ def launch():
     app = QApplication([])
     app.setApplicationName("MetaMan")
     app.setApplicationDisplayName("MetaMan")
+    app.setStyle("Fusion")
+    app.setFont(QFont(FONT_FAMILY, 10))
+    app.setStyleSheet(STYLESHEET)
 
     splash = None
     logo_path = _resolve_logo_path()
@@ -989,3 +1163,7 @@ def launch():
     if splash is not None:
         splash.finish(win)
     app.exec()
+
+
+if __name__ == "__main__":
+    launch()

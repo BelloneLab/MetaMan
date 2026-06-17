@@ -132,7 +132,14 @@ class DataReorganizerTab(QWidget):
             tbl.setWordWrap(False)
             tbl.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
             tbl.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
-            tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+            hdr = tbl.horizontalHeader()
+            hdr.setSectionResizeMode(QHeaderView.Interactive)
+            # Headers were getting clipped (e.g. "Detected datatype"). Left-align,
+            # give a sane minimum, stretch the last column, and size to the labels.
+            hdr.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            hdr.setMinimumSectionSize(96)
+            hdr.setStretchLastSection(True)
+            tbl.resizeColumnsToContents()
         self.lst_extra_cols.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.lst_extra_cols.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
 

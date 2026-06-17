@@ -1,10 +1,22 @@
 import os
 from pathlib import Path
 
+# Standard folder names that live directly under a project's data root. These
+# are the conventional names for every MetaMan project (not just one project):
+# <data_root>/rawData/<project>/...  and  <data_root>/processedData/<project>/...
+RAW_DIR_NAME = "rawData"
+PROCESSED_DIR_NAME = "processedData"
+
+# Folder basenames that mark a raw/processed root. Used to recognise when a
+# chosen path already points *inside* the raw/processed tree so we can step up
+# to the real data root. Includes the legacy "raw"/"processed" names.
+RAW_DIR_ALIASES = ("raw", "rawdata")
+PROCESSED_DIR_ALIASES = ("processed", "processeddata")
+
 # defaults (change if you like; the UI will remember your changes)
 DEFAULT_DATA_ROOT = os.path.join(os.path.expanduser("~"), "MetaManData")
-DEFAULT_RAW_ROOT = os.path.join(DEFAULT_DATA_ROOT, "raw")
-DEFAULT_PROCESSED_ROOT = os.path.join(DEFAULT_DATA_ROOT, "processed")
+DEFAULT_RAW_ROOT = os.path.join(DEFAULT_DATA_ROOT, RAW_DIR_NAME)
+DEFAULT_PROCESSED_ROOT = os.path.join(DEFAULT_DATA_ROOT, PROCESSED_DIR_NAME)
 
 APP_NAME = "neuro_meta_app_qt"
 SETTINGS_FILE = Path.home() / f".{APP_NAME}_settings.json"
