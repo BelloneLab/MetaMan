@@ -86,7 +86,7 @@ class LevelChain(QWidget):
             if is_marker_level(key):
                 folder = marker_folder_name(lvl)
                 val = QLabel(folder)
-                val.setStyleSheet("color:#a79fbb; font-style:italic;")
+                val.setStyleSheet("color:#8b8694; font-style:italic;")
                 self._grid.addWidget(val, grid_row, base_col + 1)
                 self._rows.append({"key": key, "label": label, "is_marker": True,
                                    "folder": folder, "combo": None})

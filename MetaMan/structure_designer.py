@@ -101,27 +101,27 @@ class BlockChainEditor(QWidget):
         self.list.setStyleSheet(
             f"""
             QListWidget {{
-                border: 1px solid {self._accent}55;
-                border-radius: 10px;
+                border: 1px solid {self._accent}44;
+                border-radius: 12px;
                 padding: 8px;
-                background: #1b1a24;
+                background: #ffffff;
             }}
             QListWidget::item {{
                 margin: 3px 0px;
                 padding: 12px 12px;
-                border: 1px solid #3a3548;
-                border-left: 5px solid #3a3548;
+                border: 1px solid #e6e3f0;
+                border-left: 5px solid #e6e3f0;
                 border-radius: 10px;
-                background: #262232;
+                background: #ffffff;
                 font-size: 12px;
             }}
             QListWidget::item:selected {{
                 border: 1px solid {self._accent};
                 border-left: 5px solid {self._accent};
-                background: #322a4c;
+                background: #f3f0fb;
             }}
             QListWidget::item:hover {{
-                background: #2c2740;
+                background: #f7f6fc;
             }}
             """
         )
@@ -147,9 +147,9 @@ class BlockChainEditor(QWidget):
         self.lbl_chain = QLabel("\u2014")
         self.lbl_chain.setWordWrap(True)
         self.lbl_chain.setStyleSheet(
-            "padding: 8px 10px; background: #1b1a24; "
-            "border: 1px solid #3a3548; border-radius: 8px; "
-            "font-size: 12px; color: #cfc7e6;"
+            "padding: 8px 10px; background: #f7f6fc; "
+            "border: 1px solid #e6e3f0; border-radius: 8px; "
+            "font-size: 12px; color: #6f6a7a;"
         )
         root.addWidget(self.lbl_chain)
 
@@ -237,13 +237,13 @@ class BlockChainEditor(QWidget):
         item.setText(f"  \u28ff    {status_icon}  {icon}   {display}      \u2014  {kind}")
         item.setToolTip(f"{desc}\nDrag the \u28ff handle to reorder \u2022 Double-click to toggle")
 
-        # Colour coding (grey/purple): brightened text on a dark, colour-tinted row
+        # Colour coding: darkened colour text on a light, colour-tinted row
         if enabled:
-            item.setForeground(QColor(_mix(color, "#ffffff", 0.66)))
-            item.setBackground(QColor(_mix(color, "#262232", 0.20)))
+            item.setForeground(QColor(_mix(color, "#2a2533", 0.45)))
+            item.setBackground(QColor(_mix(color, "#ffffff", 0.86)))
         else:
-            item.setForeground(QColor("#6f6885"))
-            item.setBackground(QColor("#201e2a"))
+            item.setForeground(QColor("#b6b1c2"))
+            item.setBackground(QColor("#f7f6fc"))
 
         font = item.font()
         font.setBold(enabled)
@@ -426,7 +426,7 @@ class StructureDesignerDialog(QDialog):
         hdr = QLabel(
             "<span style='font-size:14px; font-weight:700;'>"
             "\U0001f3d7\ufe0f  Structure playground</span><br/>"
-            "<span style='color:#93a4c2; font-size:11px;'>"
+            "<span style='color:#6f6a7a; font-size:11px;'>"
             "Drag blocks up/down to reorder nesting levels \u2022 "
             "Check/uncheck to enable \u2022 "
             "Rename labels for custom folder names \u2022 "
@@ -436,8 +436,8 @@ class StructureDesignerDialog(QDialog):
         )
         hdr.setWordWrap(True)
         hdr.setStyleSheet(
-            "padding: 10px 12px; background: #221c33; color: #eae9f2; "
-            "border: 1px solid #3a3548; border-radius: 10px;"
+            "padding: 10px 12px; background: #ece7fe; color: #3a3545; "
+            "border: 1px solid #ddd3fd; border-radius: 10px;"
         )
         root.addWidget(hdr)
 
@@ -460,10 +460,10 @@ class StructureDesignerDialog(QDialog):
         # Two editors side by side
         editors = QHBoxLayout()
         self.editor_raw = BlockChainEditor(
-            "\U0001f4e6  Raw chain blocks", accent="#8b5cf6"
+            "\U0001f4e6  Raw chain blocks", accent="#7c5cfc"
         )
         self.editor_proc = BlockChainEditor(
-            "\u2699\ufe0f  Processed chain blocks", accent="#22a565"
+            "\u2699\ufe0f  Processed chain blocks", accent="#1f9d57"
         )
         editors.addWidget(self.editor_raw, 1)
         editors.addWidget(self.editor_proc, 1)
@@ -479,14 +479,14 @@ class StructureDesignerDialog(QDialog):
         self.lbl_raw_preview = QLabel("\u2014")
         self.lbl_raw_preview.setWordWrap(True)
         self.lbl_raw_preview.setStyleSheet(
-            "padding: 6px; background: #1b1a24; color:#cfc7e6; border:1px solid #3a3548; border-radius: 4px;"
+            "padding: 8px; background: #f7f6fc; color:#5a3fe0; border:1px solid #e6e3f0; border-radius: 6px;"
         )
         p_lay.addWidget(self.lbl_raw_preview)
         p_lay.addWidget(QLabel("<b>Processed path pattern:</b>"))
         self.lbl_proc_preview = QLabel("\u2014")
         self.lbl_proc_preview.setWordWrap(True)
         self.lbl_proc_preview.setStyleSheet(
-            "padding: 6px; background: #1b1a24; color:#cfc7e6; border:1px solid #3a3548; border-radius: 4px;"
+            "padding: 8px; background: #f7f6fc; color:#5a3fe0; border:1px solid #e6e3f0; border-radius: 6px;"
         )
         p_lay.addWidget(self.lbl_proc_preview)
         root.addWidget(previews)

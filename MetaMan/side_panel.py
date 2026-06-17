@@ -76,27 +76,26 @@ class SidePanelLayout(QWidget):
     def style_sheet() -> str:
         return """
         #SidePanelBar {
-            background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
-                                        stop:0 #e2e8f0, stop:1 #edf1f7);
-            border-right: 1px solid #c4cdd9;
+            background: #faf9fd;
+            border-right: 1px solid #e6e3f0;
             min-width: 72px;
             max-width: 72px;
         }
         #SidePanelButton {
             font-size: 10px;
-            font-weight: 600;
+            font-weight: 700;
             border: none;
-            border-radius: 6px;
+            border-radius: 10px;
             background: transparent;
-            padding: 4px 2px;
-            color: #3b5070;
+            padding: 6px 2px;
+            color: #8b8694;
         }
         #SidePanelButton:hover {
-            background: #cfd9e7;
+            background: #ece7fe;
+            color: #5a3fe0;
         }
         #SidePanelButton:checked {
-            background: #b8cce4;
-            border: 2px solid #7ba3d4;
-            color: #1a3560;
+            background: #7c5cfc;
+            color: #ffffff;
         }
         """

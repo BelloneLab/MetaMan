@@ -919,7 +919,7 @@ class MainWindow(QMainWindow):
 
         lbl_preview = QLabel()
         lbl_preview.setWordWrap(True)
-        lbl_preview.setStyleSheet("color:#a79fbb; padding:6px; background:#1b1a24; border:1px solid #3a3548; border-radius:6px;")
+        lbl_preview.setStyleSheet("color:#6f6a7a; padding:8px; background:#f7f6fc; border:1px solid #e6e3f0; border-radius:8px;")
         lay.addWidget(lbl_preview)
 
         chk_rename = QCheckBox("Also rename the existing folders on disk (when the new name is free)")

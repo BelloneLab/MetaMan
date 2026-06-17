@@ -440,11 +440,7 @@ class NavigationTab(QWidget):
         gb.addLayout(srv_row)
 
         self.btn_sync = QPushButton("Backup project to server")
-        self.btn_sync.setStyleSheet(
-            "QPushButton { background: #d0e8ff; font-weight: 600; padding: 8px 16px; }"
-            "QPushButton:hover { background: #b0d4ff; }"
-            "QPushButton:disabled { background: #e8e8e8; color: #999; }"
-        )
+        self.btn_sync.setObjectName("Primary")
         self.btn_sync.clicked.connect(self._sync_to_server)
         gb.addWidget(self.btn_sync)
 
