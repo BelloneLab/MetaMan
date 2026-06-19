@@ -63,6 +63,11 @@ if (-not (Test-Path -LiteralPath $distFolder)) {
     throw "Build output folder not found: $distFolder"
 }
 
+$iconSource = Join-Path $root "MetaMan\assets\metaman.ico"
+if (Test-Path -LiteralPath $iconSource) {
+    Copy-Item -LiteralPath $iconSource -Destination (Join-Path $distFolder "MetaMan.ico") -Force
+}
+
 $archiveName = if ($Version) { "MetaMan-$Version-windows.zip" } else { "MetaMan-windows.zip" }
 $zipPath = Join-Path $root "dist\$archiveName"
 

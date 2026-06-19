@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 from ..services import fs_ops
 from ..services.backup_report import format_report_text, human_size, report_dir
 from ..services.server_sync import diff_tree
+from ..services.staging_service import backup_scope_destination
 from ..side_panel import SidePanelLayout
 from ..state import AppState
 from ..utils import run_in_thread
@@ -119,12 +120,20 @@ class TransferTab(QWidget):
         form.addRow("Destination:", self.cb_bk_mode)
 
         self.ed_bk_server, self.row_bk_server = self._path_row(self._pick_bk_server)
+        self.ed_bk_server.textChanged.connect(self._update_bk_destination_hint)
         form.addRow("Server root:", self.row_bk_server)
         self.ed_bk_hdd, self.row_bk_hdd = self._path_row(self._pick_bk_hdd)
+        self.ed_bk_hdd.textChanged.connect(self._update_bk_destination_hint)
         form.addRow("External HDD root:", self.row_bk_hdd)
 
         self.chk_bk_exp = QCheckBox("Back up only the current experiment")
+        self.chk_bk_exp.toggled.connect(self._update_bk_destination_hint)
         form.addRow("", self.chk_bk_exp)
+
+        self.lbl_bk_target = QLabel("Target: -")
+        self.lbl_bk_target.setObjectName("Hint")
+        self.lbl_bk_target.setWordWrap(True)
+        form.addRow("Resolved target:", self.lbl_bk_target)
 
         self.chk_bk_verify = QCheckBox("Verify copies with a checksum (slower, safest)")
         form.addRow("", self.chk_bk_verify)
@@ -191,6 +200,31 @@ class TransferTab(QWidget):
         mode = self._bk_mode()
         self.row_bk_server.setEnabled(mode in ("server", "both"))
         self.row_bk_hdd.setEnabled(mode in ("hdd", "both"))
+        self._update_bk_destination_hint()
+
+    def _backup_preview_scope(self):
+        project = self._active_project()
+        experiment = ""
+        if self.chk_bk_exp.isChecked() and self.app_state.current_experiment:
+            experiment = self.app_state.current_experiment
+        return project, experiment
+
+    def _update_bk_destination_hint(self):
+        if not hasattr(self, "lbl_bk_target"):
+            return
+        project, experiment = self._backup_preview_scope()
+        if not project:
+            self.lbl_bk_target.setText("Target: -")
+            return
+        mode = self._bk_mode()
+        rows = []
+        server_root = self.ed_bk_server.text().strip()
+        hdd_root = self.ed_bk_hdd.text().strip()
+        if mode in ("server", "both") and server_root:
+            rows.append(f"Server: {backup_scope_destination(server_root, 'server', project, experiment)}")
+        if mode in ("hdd", "both") and hdd_root:
+            rows.append(f"External HDD: {backup_scope_destination(hdd_root, 'hdd', project, experiment)}")
+        self.lbl_bk_target.setText("\n".join(rows) if rows else "Target: choose a destination root.")
 
     def _append_bk_log(self, msg: str):
         self.txt_bk_log.append(msg)
@@ -256,19 +290,33 @@ class TransferTab(QWidget):
         if not project:
             QMessageBox.warning(self, "Preview", "Select a project first.")
             return
-        dest_root = self.ed_bk_server.text().strip() or self.ed_bk_hdd.text().strip()
+        mode = self._bk_mode()
+        destination_choices = []
+        if mode in ("server", "both"):
+            destination_choices.append(("server", self.ed_bk_server.text().strip(), "server root"))
+        if mode in ("hdd", "both"):
+            destination_choices.append(("hdd", self.ed_bk_hdd.text().strip(), "external HDD root"))
+
+        kind = ""
+        dest_root = ""
+        label = "destination root"
+        for candidate_kind, candidate_root, candidate_label in destination_choices:
+            if candidate_root:
+                kind = candidate_kind
+                dest_root = candidate_root
+                label = candidate_label
+                break
         if not dest_root or not os.path.isdir(dest_root):
-            QMessageBox.warning(self, "Preview", "Choose an existing destination root first.")
+            QMessageBox.warning(self, "Preview", f"Choose an existing {label} first.")
             return
         experiment = ""
         if self.chk_bk_exp.isChecked() and self.app_state.current_experiment:
             experiment = self.app_state.current_experiment
         if experiment:
             source = self.main._experiment_dir(project, experiment)
-            dest = os.path.join(dest_root, project, experiment)
         else:
             source = self.main._resolve_project_dir(project)
-            dest = os.path.join(dest_root, project)
+        dest = backup_scope_destination(dest_root, kind, project, experiment)
         if not os.path.isdir(source):
             QMessageBox.warning(self, "Preview", f"Local source not found:\n{source}")
             return

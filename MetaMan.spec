@@ -5,9 +5,12 @@ from pathlib import Path
 
 project_root = Path.cwd()
 logo = project_root / "MetaMan" / "assests" / "metaman.png"
+app_icon = project_root / "MetaMan" / "assets" / "metaman.ico"
 datas = []
 if logo.exists():
     datas.append((str(logo), "MetaMan/assests"))
+if app_icon.exists():
+    datas.append((str(app_icon), "MetaMan/assets"))
 
 fonts_dir = project_root / "MetaMan" / "assets" / "fonts"
 if fonts_dir.is_dir():
@@ -45,6 +48,7 @@ exe = EXE(
     upx=True,
     console=False,
     disable_windowed_traceback=False,
+    icon=str(app_icon) if app_icon.exists() else None,
 )
 
 coll = COLLECT(

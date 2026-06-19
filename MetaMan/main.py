@@ -30,13 +30,17 @@ from .tabs.recording_tab import RecordingTab
 from .tabs.preprocessing_tab import PreprocessingTab
 from .tabs.data_reorganizer_tab import DataReorganizerTab
 from .tabs.transfer_tab import TransferTab
+from .tabs.search_tab import SearchTab
 from .project_bar import ProjectContextBar
 from .nav_rail import WorkspaceShell
 from .services.server_sync import sync_project_to_server, tree_size, free_space
 from .services.backup_report import build_record, write_report_files
-from .services.staging_service import load_manifest, sync_pending
+from .services.staging_service import (
+    backup_scope_destination, load_manifest, resolve_backup_data_root, sync_pending,
+)
 from .theme import STYLESHEET, FONT_FAMILY
 from .services.search_service import search_in_project, query_sessions, OPERATORS
+from .services.scrape_ops import scrape_project
 from .io_ops import (
     list_experiments, list_projects, load_session_metadata, save_session_triplet,
     save_structure_sidecar,
@@ -69,6 +73,28 @@ def _resolve_logo_path() -> str:
             if os.path.isfile(path):
                 return path
     return ""
+
+
+def _resolve_icon_path() -> str:
+    search_roots = []
+    if getattr(sys, "frozen", False):
+        search_roots.extend([getattr(sys, "_MEIPASS", ""), os.path.dirname(sys.executable)])
+    search_roots.append(os.path.dirname(__file__))
+
+    relative_candidates = [
+        os.path.join("assets", "metaman.ico"),
+        os.path.join("MetaMan", "assets", "metaman.ico"),
+        os.path.join("assests", "metaman.png"),
+        os.path.join("MetaMan", "assests", "metaman.png"),
+    ]
+    for root in search_roots:
+        if not root:
+            continue
+        for relative_path in relative_candidates:
+            path = os.path.join(root, relative_path)
+            if os.path.isfile(path):
+                return path
+    return _resolve_logo_path()
 
 
 def _resolve_font_path() -> str:
@@ -121,15 +147,21 @@ class _BackupEmitter(QObject):
     run_recorded = Signal(dict)
 
 
+class _ScrapeEmitter(QObject):
+    """Thread-safe bridge for a finished auto-scrape pass (worker → GUI thread)."""
+
+    done = Signal(str, dict)   # project_name, stats
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.resize(*WINDOW_GEOMETRY)
         self.setMinimumSize(1100, 720)
-        logo_path = _resolve_logo_path()
-        if logo_path:
-            icon = QIcon(logo_path)
+        icon_path = _resolve_icon_path()
+        if icon_path:
+            icon = QIcon(icon_path)
             if not icon.isNull():
                 self.setWindowIcon(icon)
         self.state = AppState()
@@ -138,6 +170,9 @@ class MainWindow(QMainWindow):
         self._schedule_warning_cache = set()
         self._backup_emitter = _BackupEmitter()
         self._backup_emitter.run_recorded.connect(self._on_backup_run_recorded)
+        self._scrape_emitter = _ScrapeEmitter()
+        self._scrape_emitter.done.connect(self._on_auto_scrape_done)
+        self._auto_scraped = set()  # projects auto-scraped this session
         self._build_ui()
         self._build_menu()
         self._apply_visual_style()
@@ -172,8 +207,11 @@ class MainWindow(QMainWindow):
         # Transfer hosts Backup + Staging + Schedule and needs nav_tab to exist.
         self.transfer_tab = TransferTab(self.state, self)
         self.staging_tab = self.transfer_tab.staging  # back-compat alias
+        # Search workspace: drives the query engine over the active project.
+        self.search_tab = SearchTab(self.state, self)
 
         self.tabs.add_page(self.nav_tab, "Browse", "\U0001f5c2️")
+        self.tabs.add_page(self.search_tab, "Search", "\U0001f50d")
         self.tabs.add_page(self.rec_tab, "Record", "⏺️")
         self.tabs.add_page(self.pre_tab, "Process", "⚙️")
         self.tabs.add_page(self.transfer_tab, "Transfer", "☁️")
@@ -223,6 +261,11 @@ class MainWindow(QMainWindow):
         menu_set = bar.addMenu("&Settings")
         add(menu_set, "Set Data Root…", self._menu_set_data_root)
         add(menu_set, "Folder Names (rawData / processedData)…", self._menu_folder_names)
+        act_auto_scrape = QAction("Auto-scrape metadata on open", self)
+        act_auto_scrape.setCheckable(True)
+        act_auto_scrape.setChecked(self.state.settings.auto_scrape_enabled)
+        act_auto_scrape.toggled.connect(self._toggle_auto_scrape)
+        menu_set.addAction(act_auto_scrape)
 
         # Transfer
         menu_tr = bar.addMenu("&Transfer")
@@ -303,6 +346,53 @@ class MainWindow(QMainWindow):
                 pass
         self._update_active_project_indicator()
         self.lbl_status.setText(f"Active project: {project_name}")
+        self._maybe_auto_scrape(project_name)
+
+    def _maybe_auto_scrape(self, project_name: str):
+        """Enrich the project's session metadata in the background the first time
+        it is opened this session (idempotent, off the UI thread). Controlled by
+        Settings ▸ Auto-scrape metadata on open."""
+        if not self.state.settings.auto_scrape_enabled:
+            return
+        if not project_name or project_name in self._auto_scraped:
+            return
+        project_dir = self._project_dir(project_name)
+        if not os.path.isdir(project_dir):
+            return
+        self._auto_scraped.add(project_name)
+
+        def work():
+            try:
+                stats = scrape_project(project_dir, deep=False, only_missing=True)
+            except Exception:
+                app_log.exception("Auto-scrape failed for %s", project_name)
+                stats = {}
+            self._scrape_emitter.done.emit(project_name, stats or {})
+
+        run_in_thread(work)
+
+    def _on_auto_scrape_done(self, project_name: str, stats: dict):
+        """Refresh views if the background auto-scrape enriched anything."""
+        if not stats.get("updated"):
+            return
+        for refresh in (
+            lambda: self.nav_tab.refresh_tree(collapsed=True, lazy=True),
+            self.search_tab.refresh,
+        ):
+            try:
+                refresh()
+            except Exception:
+                pass
+        self.lbl_status.setText(
+            f"Auto-scrape: enriched {stats['updated']} session(s) in {project_name}.")
+
+    def _toggle_auto_scrape(self, enabled: bool):
+        self.state.settings.auto_scrape_enabled = enabled
+        self.lbl_status.setText(
+            "Auto-scrape on open: " + ("enabled" if enabled else "disabled"))
+        if enabled and self.state.current_project:
+            self._auto_scraped.discard(self.state.current_project)
+            self._maybe_auto_scrape(self.state.current_project)
 
     def _update_active_project_indicator(self):
         name = (self.state.current_project
@@ -436,22 +526,19 @@ class MainWindow(QMainWindow):
         sync_pending(self.state.settings.data_root, log, entry_ids=entry_ids)
         return len(entry_ids)
 
+    def _backup_destination_data_root(self, destination_root: str, destination_kind: str) -> str:
+        return resolve_backup_data_root(destination_root, destination_kind)
+
     def _start_backup_copy(self, project: str, experiment: str, destination_root: str, destination_kind: str, scheduled: bool, log=None, verify: bool = False, prune: bool = False):
         sink = log or self.rec_tab.logger.log
         source_dir = self._experiment_dir(project, experiment) if experiment else self._resolve_project_dir(project)
         if not os.path.isdir(source_dir):
             sink(f"[backup] Source folder not found: {source_dir}")
             return
-        # Server mirrors local: <server_root>/<project>[/<experiment>]. The
-        # destination folder name is explicit so the source basename can never
-        # leak in (which previously created server/rawData instead of project).
-        if experiment:
-            dest_parent = os.path.join(destination_root, project)
-            dest_name = experiment
-        else:
-            dest_parent = destination_root
-            dest_name = project
-        destination_scope_root = os.path.join(dest_parent, dest_name)
+        destination_data_root = self._backup_destination_data_root(destination_root, destination_kind)
+        destination_scope_root = backup_scope_destination(destination_root, destination_kind, project, experiment)
+        dest_parent = os.path.dirname(destination_scope_root)
+        dest_name = os.path.basename(destination_scope_root)
 
         job_key = self._backup_job_key(project, experiment, destination_kind=destination_kind)
         if job_key in self._backup_jobs_in_progress:
@@ -465,6 +552,8 @@ class MainWindow(QMainWindow):
         scope = f"{project}/{experiment}" if experiment else project
         mode = "scheduled backup" if scheduled else "manual backup"
         destination_label = "external_hdd" if destination_kind == "hdd" else "server"
+        if os.path.normcase(os.path.normpath(destination_data_root)) != os.path.normcase(os.path.normpath(destination_root)):
+            sink(f"[backup] Resolved {destination_label} data root: {destination_data_root}")
 
         # Free-space precheck: refuse to start a backup that cannot possibly fit.
         needed = tree_size(source_dir)
@@ -511,7 +600,7 @@ class MainWindow(QMainWindow):
                 else:
                     log(f"[{mode}/{destination_label}] Finished in {dt:.1f}s.")
                     if not experiment:
-                        self._annotate_current_session_backup_paths(project, destination_root, destination_kind, log)
+                        self._annotate_current_session_backup_paths(project, destination_data_root, destination_kind, log)
                 ok = not stats.get("cancelled") and not stats.get("failed")
             except Exception as e:
                 run_error = str(e)
@@ -1390,6 +1479,11 @@ def launch():
     _set_windows_app_user_model_id()
     app = QApplication([])
     app.setApplicationName("MetaMan")
+    icon_path = _resolve_icon_path()
+    if icon_path:
+        icon = QIcon(icon_path)
+        if not icon.isNull():
+            app.setWindowIcon(icon)
     app.setApplicationDisplayName("MetaMan")
     app.setStyle("Fusion")
     app.setFont(QFont(_load_app_font(), 10))

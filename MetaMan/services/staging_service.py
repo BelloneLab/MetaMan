@@ -82,6 +82,28 @@ def server_raw_root(server_root: str) -> str:
     return server_root
 
 
+def resolve_backup_data_root(destination_root: str, destination_kind: str) -> str:
+    """Return the folder under which backup project data should be mirrored."""
+    if not destination_root:
+        return destination_root
+    if str(destination_kind or "").strip().lower() == "server":
+        return server_raw_root(destination_root)
+    return destination_root
+
+
+def backup_scope_destination(
+    destination_root: str,
+    destination_kind: str,
+    project: str,
+    experiment: str = "",
+) -> str:
+    """Return the final destination folder for a project or experiment backup."""
+    data_root = resolve_backup_data_root(destination_root, destination_kind)
+    if experiment:
+        return os.path.join(data_root, project, experiment)
+    return os.path.join(data_root, project)
+
+
 def list_server_experiments(server_root: str, project: str) -> List[str]:
     base = server_raw_root(server_root)
     proj_dir = os.path.join(base, project)

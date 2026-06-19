@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -47,6 +48,12 @@ from ..services.structure_schema import (
     normalize_structure_schema, LEVEL_COLORS, META_KEY_FOR_LEVEL,
 )
 from ..services.metadata_scraper import scrape_session, merge_auto, classify_modality, is_probably_local
+from ..services.session_assets import (
+    load_notes,
+    read_metadata_update_file,
+    save_notes,
+    upload_files_to_project,
+)
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 
 # ── level dot icons (cached) ───────────────────────────────────────────
@@ -168,7 +175,15 @@ def table_to_dict(tbl: QTableWidget) -> Dict[str, Any]:
         k = (kitem.text() if kitem else "").strip()
         if not k:
             continue
-        out[k] = vitem.text() if vitem else ""
+        value = vitem.text() if vitem else ""
+        stripped = value.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                out[k] = json.loads(stripped)
+                continue
+            except Exception:
+                pass
+        out[k] = value
     return out
 
 
@@ -178,7 +193,11 @@ def dict_to_table(tbl: QTableWidget, data: Dict[str, Any]):
         r = tbl.rowCount()
         tbl.insertRow(r)
         tbl.setItem(r, 0, QTableWidgetItem(str(k)))
-        tbl.setItem(r, 1, QTableWidgetItem(v if isinstance(v, str) else str(v)))
+        if isinstance(v, (dict, list)):
+            text = json.dumps(v, ensure_ascii=False)
+        else:
+            text = v if isinstance(v, str) else str(v)
+        tbl.setItem(r, 1, QTableWidgetItem(text))
     tbl.resizeColumnsToContents()
 
 
@@ -237,6 +256,7 @@ class NavigationTab(QWidget):
         self._pending_stats = None
         self._stats_emitter = _StatsEmitter()
         self._stats_emitter.ready.connect(self._on_stats_ready)
+        self._notes_editors: Dict[str, QTextEdit] = {}
         self._build_ui()
         self.refresh_tree(collapsed=True, lazy=True)
         saved = self.app_state.settings.get_explorer_settings().get("server_root", "")
@@ -371,6 +391,7 @@ class NavigationTab(QWidget):
         tbl.setHorizontalHeaderLabels(["Key", "Value"])
         tbl.horizontalHeader().setStretchLastSection(True)
         lay.addWidget(tbl, 1)
+        self._add_scope_notes_editor(lay, key, label)
 
         row = QHBoxLayout()
         b_add = QPushButton("Add row")
@@ -380,8 +401,10 @@ class NavigationTab(QWidget):
         b_rm.clicked.connect(lambda: self._remove_selected(tbl))
         row.addWidget(b_rm)
         b_save = QPushButton(f"Save {label.lower()} info")
+        b_save.setToolTip("Saves table fields and notes.")
         b_save.clicked.connect(lambda: self._save_info_for_kind(key))
         row.addWidget(b_save)
+        self._add_scope_file_actions(row, key)
         if key == "subject":
             b_csv = QPushButton("Load subject infos from CSV\u2026")
             b_csv.clicked.connect(self._load_subject_csv)
@@ -407,6 +430,7 @@ class NavigationTab(QWidget):
         self.tbl_session.setHorizontalHeaderLabels(["Key", "Value"])
         self.tbl_session.horizontalHeader().setStretchLastSection(True)
         lay.addWidget(self.tbl_session, 1)
+        self._add_scope_notes_editor(lay, "session", "Session")
         row = QHBoxLayout()
         b_add = QPushButton("Add row")
         b_add.clicked.connect(lambda: self._add_row(self.tbl_session))
@@ -415,14 +439,48 @@ class NavigationTab(QWidget):
         b_rm.clicked.connect(lambda: self._remove_selected(self.tbl_session))
         row.addWidget(b_rm)
         b_save = QPushButton("Save session metadata")
+        b_save.setToolTip("Saves table fields and notes.")
         b_save.clicked.connect(self._save_session_metadata)
         row.addWidget(b_save)
+        self._add_scope_file_actions(row, "session")
         lay.addLayout(row)
 
         # Ctrl+C and right-click copy on the session metadata table
         self.tbl_session.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tbl_session.customContextMenuRequested.connect(self._session_table_context_menu)
         self.tbl_session.installEventFilter(self)
+
+    def _add_scope_notes_editor(self, lay: QVBoxLayout, kind: str, label: str):
+        notes_label = QLabel(f"{label} notes")
+        notes_label.setObjectName("Hint")
+        lay.addWidget(notes_label)
+
+        editor = QTextEdit()
+        editor.setAcceptRichText(False)
+        editor.setMinimumHeight(96)
+        editor.setMaximumHeight(160)
+        editor.setPlaceholderText(
+            f"Write notes for this {label.lower()} here."
+        )
+        lay.addWidget(editor)
+        self._notes_editors[kind] = editor
+
+    def _add_scope_file_actions(self, row: QHBoxLayout, kind: str):
+        b_import_meta = QPushButton("Update metadata from file...")
+        b_import_meta.setToolTip(
+            "Import CSV/TXT/JSON fields into the selected "
+            f"{self._scope_label(kind).lower()} metadata."
+        )
+        b_import_meta.clicked.connect(lambda _checked=False, k=kind: self._import_metadata_file_for_scope(k))
+        row.addWidget(b_import_meta)
+
+        b_upload = QPushButton("Upload files to project...")
+        b_upload.setToolTip(
+            "Copy arbitrary files into the project upload folder and record them "
+            f"on the selected {self._scope_label(kind).lower()}."
+        )
+        b_upload.clicked.connect(lambda _checked=False, k=kind: self._upload_files_for_scope(k))
+        row.addWidget(b_upload)
 
     # ── tree ──────────────────────────────────────────────────────
 
@@ -744,6 +802,8 @@ class NavigationTab(QWidget):
                 self.app_state.settings.last_opened_project = project
             self._browse_set_current(project=project, experiment="", animal="", session="", session_path="")
             info = self._without_stat_keys(load_project_info(path))
+            self._load_scope_notes_panel("project", path, info)
+            info = self._without_note_keys(info)
             self.lbl_proj.setText(project); self.lbl_proj_path.setText(path)
             self.right_tabs.setCurrentIndex(0)
             self._fill_info_with_stats(self.tbl_proj, info, project, path, 0)
@@ -769,7 +829,8 @@ class NavigationTab(QWidget):
                 except Exception:
                     pass
             self.lbl_session.setText(session); self.lbl_session_path.setText(path)
-            dict_to_table(self.tbl_session, meta)
+            self._load_scope_notes_panel("session", path, meta)
+            dict_to_table(self.tbl_session, self._without_note_keys(meta))
             self.right_tabs.setCurrentIndex(3)
             return
 
@@ -777,6 +838,8 @@ class NavigationTab(QWidget):
             self._browse_set_current(project=project, experiment=os.path.basename(path),
                                      animal="", session="", session_path="")
             info = self._without_stat_keys(load_experiment_info(path))
+            self._load_scope_notes_panel("experiment", path, info)
+            info = self._without_note_keys(info)
             self.lbl_exp.setText(os.path.basename(path)); self.lbl_exp_path.setText(path)
             self.right_tabs.setCurrentIndex(1)
             self._fill_info_with_stats(self.tbl_exp, info, project, path, idx + 1)
@@ -786,6 +849,8 @@ class NavigationTab(QWidget):
             self._browse_set_current(project=project, experiment=experiment,
                                      animal=os.path.basename(path), session="", session_path="")
             info = self._without_stat_keys(load_subject_info(path))
+            self._load_scope_notes_panel("subject", path, info)
+            info = self._without_note_keys(info)
             self.lbl_sub.setText(os.path.basename(path)); self.lbl_sub_path.setText(path)
             self.right_tabs.setCurrentIndex(2)
             self._fill_info_with_stats(self.tbl_sub, info, project, path, idx + 1)
@@ -794,6 +859,7 @@ class NavigationTab(QWidget):
         # Intermediate non-core level (recording / trial / marker): track context only.
         self._browse_set_current(project=project, experiment=experiment, animal=subject,
                                  session="", session_path="")
+        self._clear_scope_notes_panels()
 
     def _browse_set_current(self, **kwargs):
         """Update the active dataset context, but only while browsing Local –
@@ -940,6 +1006,15 @@ class NavigationTab(QWidget):
         if not isinstance(data, dict):
             return {}
         return {k: v for k, v in data.items() if not str(k).startswith("_stat_") and not str(k).startswith("stats_")}
+
+    def _without_note_keys(self, data):
+        if not isinstance(data, dict):
+            return {}
+        note_keys = {"notes", "sessionnotes"}
+        return {
+            k: v for k, v in data.items()
+            if _norm_header(str(k)) not in note_keys
+        }
 
     # ── actions ───────────────────────────────────────────────────
 
@@ -1155,43 +1230,244 @@ class NavigationTab(QWidget):
         for r in sorted({i.row() for i in tbl.selectedIndexes()}, reverse=True):
             tbl.removeRow(r)
 
-    def _save_info_for_kind(self, kind):
-        sel = self._get_selected()
-        if not sel:
-            return
-        skind, path, _ = sel
-        if skind != kind:
-            QMessageBox.warning(self, "Selection", f"Select a {kind} node first.")
-            return
+    def _scope_label(self, kind: str) -> str:
+        return {
+            "project": "Project",
+            "experiment": "Experiment",
+            "subject": "Subject",
+            "session": "Session",
+        }.get(str(kind or "").strip().lower(), "Scope")
+
+    def _scope_table(self, kind: str):
         if kind == "project":
-            data = table_to_dict(self.tbl_proj)
-        elif kind == "experiment":
-            data = table_to_dict(self.tbl_exp)
-        elif kind == "subject":
-            data = table_to_dict(self.tbl_sub)
-        else:
-            return
-        for k in list(data.keys()):
-            if k.startswith("_stat_") or k.startswith("stats_"):
-                data.pop(k, None)
+            return self.tbl_proj
+        if kind == "experiment":
+            return self.tbl_exp
+        if kind == "subject":
+            return self.tbl_sub
+        if kind == "session":
+            return self.tbl_session
+        return None
+
+    def _selected_scope_context(self, kind: str) -> Optional[Dict[str, Any]]:
+        ctx = self._selected_context()
+        label = self._scope_label(kind).lower()
+        if not ctx:
+            QMessageBox.warning(self, "Selection", f"Select a {label} node first.")
+            return None
+        actual = "session" if ctx.get("is_leaf") else str(ctx.get("kind", ""))
+        if actual != kind:
+            QMessageBox.warning(self, "Selection", f"Select a {label} node first.")
+            return None
+        path = str(ctx.get("path", "") or "")
+        if not path or not os.path.isdir(path):
+            QMessageBox.warning(self, "Selection", f"The selected {label} folder could not be found.")
+            return None
+        return ctx
+
+    def _metadata_from_scope_table(self, kind: str) -> Dict[str, Any]:
+        table = self._scope_table(kind)
+        data = table_to_dict(table) if table is not None else {}
+        data = self._without_note_keys(data)
+        if kind != "session":
+            data = self._without_stat_keys(data)
+        return data
+
+    def _current_scope_metadata(self, kind: str) -> Dict[str, Any]:
+        return self._metadata_with_scope_notes(kind, self._metadata_from_scope_table(kind))
+
+    def _scope_stat_fields(self, kind: str) -> Dict[str, Any]:
+        table = self._scope_table(kind)
+        if table is None or kind == "session":
+            return {}
+        data = table_to_dict(table)
+        return {k: v for k, v in data.items() if str(k).startswith("_stat_") or str(k).startswith("stats_")}
+
+    def _write_scope_metadata(self, kind: str, path: str, metadata: Dict[str, Any]):
         if kind == "project":
+            data = self._without_stat_keys(metadata)
             save_project_info(path, data)
+            dict_to_table(self.tbl_proj, {**self._scope_stat_fields(kind), **self._without_note_keys(data)})
         elif kind == "experiment":
+            data = self._without_stat_keys(metadata)
             save_experiment_info(path, data)
+            dict_to_table(self.tbl_exp, {**self._scope_stat_fields(kind), **self._without_note_keys(data)})
         elif kind == "subject":
+            data = self._without_stat_keys(metadata)
             save_subject_info(path, data)
-        QMessageBox.information(self, "Saved", f"{kind.capitalize()} info saved.")
+            dict_to_table(self.tbl_sub, {**self._scope_stat_fields(kind), **self._without_note_keys(data)})
+        elif kind == "session":
+            self._write_session_metadata(path, metadata)
+
+    def _notes_editor(self, kind: str) -> Optional[QTextEdit]:
+        return self._notes_editors.get(kind)
+
+    def _scope_notes_text(self, kind: str) -> str:
+        editor = self._notes_editor(kind)
+        return editor.toPlainText().strip() if editor is not None else ""
+
+    def _set_scope_notes(self, kind: str, text: str):
+        editor = self._notes_editor(kind)
+        if editor is not None:
+            editor.setPlainText(str(text or ""))
+
+    def _append_scope_notes(self, kind: str, notes: str):
+        clean_notes = str(notes or "").strip()
+        if not clean_notes:
+            return
+        current = self._scope_notes_text(kind)
+        self._set_scope_notes(kind, f"{current}\n\n{clean_notes}".strip() if current else clean_notes)
+
+    def _load_scope_notes_panel(self, kind: str, path: str, metadata: Dict[str, Any]):
+        if kind == "session":
+            notes = load_notes(path, metadata)
+        else:
+            notes = str(metadata.get("Notes") or metadata.get("notes") or "")
+        self._clear_scope_notes_panels(keep=kind)
+        self._set_scope_notes(kind, notes)
+
+    def _clear_scope_notes_panels(self, keep: str = ""):
+        for kind, editor in self._notes_editors.items():
+            if kind != keep:
+                editor.clear()
+
+    def _metadata_with_scope_notes(self, kind: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        data = dict(metadata)
+        notes = self._scope_notes_text(kind)
+        if notes:
+            data["Notes"] = notes
+        else:
+            data.pop("Notes", None)
+            data.pop("notes", None)
+        return data
+
+    @staticmethod
+    def _append_uploaded_records(metadata: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str, Any]:
+        data = dict(metadata)
+        uploaded = data.get("uploaded_files", [])
+        if isinstance(uploaded, str):
+            try:
+                uploaded = json.loads(uploaded)
+            except Exception:
+                uploaded = []
+        if not isinstance(uploaded, list):
+            uploaded = []
+        data["uploaded_files"] = uploaded + records
+        return data
+
+    def _save_info_for_kind(self, kind):
+        ctx = self._selected_scope_context(kind)
+        if not ctx:
+            return
+        self._write_scope_metadata(kind, ctx["path"], self._current_scope_metadata(kind))
+        QMessageBox.information(self, "Saved", f"{self._scope_label(kind)} info saved.")
 
     def _save_session_metadata(self):
-        sel = self._get_selected()
-        if not sel:
+        path = self._selected_session_path()
+        if not path:
             return
-        kind, path, _ = sel
-        if kind != "session":
-            QMessageBox.warning(self, "Selection", "Select a session node first.")
-            return
-        save_session_triplet(path, table_to_dict(self.tbl_session))
+        self._write_session_metadata(path, self._current_scope_metadata("session"))
         QMessageBox.information(self, "Saved", "Session metadata saved.")
+
+    def _selected_session_path(self) -> str:
+        ctx = self._selected_context()
+        if ctx and ctx.get("is_leaf") and os.path.isdir(ctx["path"]):
+            return ctx["path"]
+        path = str(getattr(self.app_state, "current_session_path", "") or "")
+        if path and os.path.isdir(path):
+            return path
+        QMessageBox.warning(self, "Selection", "Select a session node first.")
+        return ""
+
+    def _write_session_metadata(self, session_dir: str, metadata: Dict[str, Any]):
+        data = dict(metadata)
+        save_session_triplet(session_dir, data)
+        save_notes(session_dir, data.get("Notes", ""))
+        dict_to_table(self.tbl_session, self._without_note_keys(data))
+
+    def _save_session_notes(self):
+        path = self._selected_session_path()
+        if not path:
+            return
+        self._write_session_metadata(path, self._current_scope_metadata("session"))
+        QMessageBox.information(self, "Saved", "Session notes saved.")
+
+    def _import_metadata_file_for_scope(self, kind: str):
+        ctx = self._selected_scope_context(kind)
+        if not ctx:
+            return
+        label = self._scope_label(kind)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Choose {label.lower()} metadata file",
+            "",
+            "Metadata files (*.csv *.tsv *.txt *.json);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            fields, notes = read_metadata_update_file(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Import metadata", f"Could not read metadata file:\n{exc}")
+            return
+
+        if not fields and not notes:
+            QMessageBox.information(self, "Import metadata", "No metadata fields or notes were found.")
+            return
+
+        metadata = self._current_scope_metadata(kind)
+        metadata.update(fields)
+        if notes:
+            self._append_scope_notes(kind, notes)
+            metadata = self._metadata_with_scope_notes(kind, metadata)
+        self._write_scope_metadata(kind, ctx["path"], metadata)
+        QMessageBox.information(
+            self,
+            "Import metadata",
+            f"Imported {len(fields)} {label.lower()} field(s)" + (" and appended notes." if notes else "."),
+        )
+
+    def _import_session_metadata_file(self):
+        self._import_metadata_file_for_scope("session")
+
+    def _upload_files_for_scope(self, kind: str):
+        ctx = self._selected_scope_context(kind)
+        if not ctx:
+            return
+        label = self._scope_label(kind)
+        project_dir = ctx.get("proj_dir", "")
+        if not project_dir or not os.path.isdir(project_dir):
+            QMessageBox.warning(self, "Upload files", "Project folder could not be resolved.")
+            return
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Upload files to project",
+            "",
+            "Common metadata files (*.csv *.tsv *.txt *.json *.xlsx *.xls);;All files (*)",
+        )
+        if not files:
+            return
+        context_parts = list(ctx.get("parts", []) or [])
+        try:
+            records = upload_files_to_project(project_dir, files, context_parts=context_parts)
+        except Exception as exc:
+            QMessageBox.critical(self, "Upload files", f"Upload failed:\n{exc}")
+            return
+        if not records:
+            QMessageBox.information(self, "Upload files", "No files were uploaded.")
+            return
+
+        metadata = self._append_uploaded_records(self._current_scope_metadata(kind), records)
+        self._write_scope_metadata(kind, ctx["path"], metadata)
+        QMessageBox.information(
+            self,
+            "Upload files",
+            f"Uploaded {len(records)} file(s) for this {label.lower()} into:\n"
+            f"{os.path.join(project_dir, '_metaman_uploads')}",
+        )
+
+    def _upload_files_to_project(self):
+        self._upload_files_for_scope("session")
 
     # ── CSV import ────────────────────────────────────────────────
 
