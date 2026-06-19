@@ -1,83 +1,51 @@
+"""Backward-compatible search facade over the analysis engine in ``query.py``.
+
+The GUI ("Find Sessions", "Search in Project") imports the three public names
+below. They now delegate to :mod:`MetaMan.services.query`, which means the
+interactive search and a Python analysis query share one implementation and one
+set of operators, and both understand the canonical ``metadata.json`` *and* the
+acquisition ``*_metadata.json`` dialect (the old code only saw ``metadata.json``).
+"""
+
 import json
-import os
 from typing import Any, Dict, List, Tuple
 
-OPERATORS = ["=", "!=", "contains", ">", ">=", "<", "<="]
+from .query import OPERATORS, ProjectQuery, compare, field_value, iter_sessions
 
-
-def _to_float(x):
-    try:
-        return float(str(x).strip())
-    except Exception:
-        return None
-
-
-def _match(meta: Dict[str, Any], field: str, op: str, value: str) -> bool:
-    raw = meta.get(field, "")
-    left = "" if raw is None else (json.dumps(raw, ensure_ascii=False) if isinstance(raw, (dict, list)) else str(raw))
-    lv = left.strip().lower()
-    rv = str(value).strip().lower()
-    if op == "=":
-        return lv == rv
-    if op == "!=":
-        return lv != rv
-    if op == "contains":
-        return rv in lv
-    # numeric comparisons fall back to string ordering when not numeric
-    a, b = _to_float(left), _to_float(value)
-    if a is not None and b is not None:
-        if op == ">":
-            return a > b
-        if op == ">=":
-            return a >= b
-        if op == "<":
-            return a < b
-        if op == "<=":
-            return a <= b
-    if op == ">":
-        return lv > rv
-    if op == ">=":
-        return lv >= rv
-    if op == "<":
-        return lv < rv
-    if op == "<=":
-        return lv <= rv
-    return False
+# Re-exported so existing callers keep working; the richer operator set now
+# flows straight into the Find Sessions dialog's drop-down.
+__all__ = ["OPERATORS", "query_sessions", "search_in_project", "compare"]
 
 
 def query_sessions(project_dir: str, filters: List[Tuple[str, str, str]]) -> List[Dict]:
-    """Return sessions under *project_dir* whose ``metadata.json`` satisfies ALL
-    *(field, op, value)* filters. Each result is ``{"path", "meta"}``.
-
-    Enables structured queries like ``Region = CA1`` AND
-    ``Auto: sample rate (Hz) > 30000`` that the plain substring search cannot."""
-    filters = [(f, o, v) for (f, o, v) in filters if str(f).strip()]
-    results: List[Dict] = []
-    for root, _dirs, files in os.walk(project_dir):
-        if "metadata.json" not in files:
-            continue
-        try:
-            with open(os.path.join(root, "metadata.json"), "r", encoding="utf-8") as fh:
-                meta = json.load(fh)
-        except Exception:
-            continue
-        if all(_match(meta, f, o, v) for (f, o, v) in filters):
-            results.append({"path": root, "meta": meta})
-    return results
+    """Return sessions under *project_dir* matching ALL ``(field, op, value)``
+    filters. Each result is ``{"path", "meta"}`` (``meta`` is identity-normalised
+    so a query on ``Subject`` works regardless of metadata dialect)."""
+    pq = ProjectQuery(project_dir)
+    for field, op, value in filters:
+        if str(field).strip():
+            pq = pq.where(field, op, value)
+    return [{"path": r["path"], "meta": r["meta"]} for r in pq.records()]
 
 
 def search_in_project(project_dir: str, query: str) -> List[Dict]:
+    """Free-text search across every session's metadata (both dialects). Returns
+    ``{"path", "key", "value"}`` hits where *query* appears in a key or value."""
+    q = (query or "").strip().lower()
+    if not q:
+        return []
     hits: List[Dict] = []
-    q = (query or "").lower()
-    for root, dirs, files in os.walk(project_dir):
-        if "metadata.json" in files:
-            p = os.path.join(root, "metadata.json")
-            try:
-                data = json.loads(open(p, "r", encoding="utf-8").read())
-                for k, v in data.items():
-                    s = json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v)
-                    if q in (k.lower() + " " + s.lower()):
-                        hits.append({"path": root, "key": k, "value": (s[:200] + "..." if len(s) > 200 else s)})
-            except Exception:
-                pass
+    for rec in iter_sessions(project_dir):
+        for k, v in rec["meta"].items():
+            s = json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v)
+            if q in (k.lower() + " " + s.lower()):
+                hits.append({
+                    "path": rec["path"], "key": k,
+                    "value": (s[:200] + "…" if len(s) > 200 else s),
+                })
     return hits
+
+
+# Kept for any external caller that imported the old helper directly.
+def _match(meta: Dict[str, Any], field: str, op: str, value: str) -> bool:
+    return compare(meta.get(field, ""), op, value)

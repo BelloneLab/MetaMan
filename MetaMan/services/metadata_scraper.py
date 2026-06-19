@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Dict, List, Tuple
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".mpg", ".mpeg"}
+AUDIO_EXTS = {".wav", ".flac", ".ogg", ".aac", ".m4a"}
 
 
 def is_probably_local(path: str) -> bool:
@@ -62,15 +63,22 @@ def _fmt_duration(seconds: float) -> str:
 
 def classify_modality(exts: Dict[str, int], names: List[str]) -> str:
     low = [n.lower() for n in names]
+    joined = " ".join(low)
     mods: List[str] = []
     if any(n.endswith(".ap.bin") or n.endswith(".lf.bin") or n.endswith(".ap.meta")
-           or n.endswith(".lf.meta") for n in low) or ".imec" in " ".join(low):
+           or n.endswith(".lf.meta") for n in low) or ".imec" in joined:
         mods.append("Neuropixels (SpikeGLX)")
+    if any(n.endswith((".nidq.bin", ".nidq.meta")) for n in low):
+        mods.append("NI-DAQ sync")
     if VIDEO_EXTS & set(exts):
         mods.append("Behavioral video")
-    if any(("dlc" in n or "deeplabcut" in n) and n.endswith((".csv", ".h5"))
+    if AUDIO_EXTS & set(exts):
+        mods.append("Audio (mic/USV)")
+    if any(("dlc" in n or "deeplabcut" in n or "tracking" in n) and n.endswith((".csv", ".h5"))
            for n in low):
         mods.append("Pose tracking (DLC)")
+    if any("ttl" in n and n.endswith(".csv") for n in low):
+        mods.append("TTL / events")
     if any(n.endswith(".nwb") for n in low):
         mods.append("NWB")
     if any(n.endswith((".doric", ".ppd")) or "fip" in n or "photometry" in n for n in low):
@@ -164,6 +172,50 @@ def _scrape_video(video_paths: List[str]) -> Dict[str, object]:
     return out
 
 
+# ── audio (.wav via stdlib, no extra dependency) ────────────────────────────
+
+def _scrape_audio(audio_paths: List[str]) -> Dict[str, object]:
+    if not audio_paths:
+        return {}
+    out: Dict[str, object] = {"Auto: audio files": len(audio_paths)}
+    wavs = sorted(p for p in audio_paths if p.lower().endswith(".wav"))
+    if not wavs:
+        return out
+    import wave
+    try:
+        with wave.open(wavs[0], "rb") as w:
+            rate = w.getframerate()
+            frames = w.getnframes()
+            channels = w.getnchannels()
+    except Exception:
+        return out
+    out["Auto: audio"] = os.path.basename(wavs[0])
+    if rate:
+        out["Auto: audio sample rate (Hz)"] = f"{rate:,}"
+        # A >=192 kHz microphone is the tell-tale of ultrasonic vocalisation rigs.
+        if rate >= 150_000:
+            out["Auto: audio kind"] = "ultrasonic (USV)"
+    if channels:
+        out["Auto: audio channels"] = channels
+    if rate and frames:
+        out["Auto: audio duration"] = _fmt_duration(frames / rate)
+    return out
+
+
+# ── behaviour / sync inventory (cheap, name-based) ──────────────────────────
+
+def _scrape_behavior(names: List[str]) -> Dict[str, object]:
+    low = [n.lower() for n in names]
+    out: Dict[str, object] = {}
+    if any("ttl" in n and n.endswith(".csv") for n in low):
+        out["Auto: has TTL events"] = "yes"
+    if any("behavior_summary" in n for n in low):
+        out["Auto: has behavior summary"] = "yes"
+    if any(("dlc" in n or "tracking" in n) and n.endswith((".csv", ".h5")) for n in low):
+        out["Auto: has pose tracking"] = "yes"
+    return out
+
+
 # ── public API ───────────────────────────────────────────────────────────
 
 def scrape_session(session_dir: str, deep: bool = True) -> Dict[str, object]:
@@ -180,6 +232,7 @@ def scrape_session(session_dir: str, deep: bool = True) -> Dict[str, object]:
     mtimes: List[float] = []
     names: List[str] = []
     video_paths: List[str] = []
+    audio_paths: List[str] = []
     file_count = 0
 
     for root, _dirs, files in os.walk(session_dir):
@@ -191,6 +244,8 @@ def scrape_session(session_dir: str, deep: bool = True) -> Dict[str, object]:
             exts[ext] = exts.get(ext, 0) + 1
             if ext in VIDEO_EXTS:
                 video_paths.append(p)
+            if ext in AUDIO_EXTS:
+                audio_paths.append(p)
             try:
                 total += os.path.getsize(p)
                 mtimes.append(os.path.getmtime(p))
@@ -213,9 +268,11 @@ def scrape_session(session_dir: str, deep: bool = True) -> Dict[str, object]:
     if modality:
         out["Auto: modality"] = modality
 
+    out.update(_scrape_behavior(names))
     out.update(_scrape_spikeglx(session_dir))
     if deep:
         out.update(_scrape_video(video_paths))
+        out.update(_scrape_audio(audio_paths))
     return out
 
 
