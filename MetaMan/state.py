@@ -44,6 +44,7 @@ class AppSettings:
             "loaded_project": {},
             "structure_schema": {},
             "structure_schemas_by_project": {},
+            "auto_scrape_enabled": True,  # auto-enrich metadata when a project opens
             "_version": SETTINGS_VERSION,
         }
         self._lock = threading.RLock()
@@ -505,6 +506,15 @@ class AppSettings:
     def put_project_structure_schema(self, project: str, schema: Dict[str, Any]):
         d = self._data.setdefault("structure_schemas_by_project", {})
         d[project] = dict(schema or {})
+        self.save()
+
+    @property
+    def auto_scrape_enabled(self) -> bool:
+        return bool(self._data.get("auto_scrape_enabled", True))
+
+    @auto_scrape_enabled.setter
+    def auto_scrape_enabled(self, v: bool):
+        self._data["auto_scrape_enabled"] = bool(v)
         self.save()
 
     @property

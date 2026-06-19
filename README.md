@@ -6,11 +6,12 @@
 
 ### 🧠 Neuro data organization without the folder chaos
 
-*Browse it. Record it. Process it. Back it up. Reorganize it. All in one calm, violet little workspace.*
+*Browse it. Search it. Record it. Process it. Back it up. Reorganize it. Query it from Python. All in one calm, violet little workspace.*
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-2f6db3?logo=python&logoColor=white)](https://www.python.org/)
 [![UI](https://img.shields.io/badge/UI-PySide6-0e7a5f?logo=qt&logoColor=white)](https://doc.qt.io/qtforpython/)
 [![Data](https://img.shields.io/badge/Data-CSV%20%7C%20HDF5%20%7C%20JSON-8a4f7d)](#)
+[![Analysis](https://img.shields.io/badge/Analysis-pandas--ready-150458?logo=pandas&logoColor=white)](#-bonus-query-your-whole-lab-from-python)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-5a3fe0)](#)
 [![Safe copies](https://img.shields.io/badge/Copies-atomic%20%2B%20verified-1f9d57)](#-safe-by-default)
 
@@ -28,27 +29,33 @@
 
 ## ✨ Why MetaMan?
 
-Neuroscience data is a hierarchy: **project → experiment → subject → session → files**. The problem is never the data, it is everything *around* it: folders that drift apart between rigs, metadata that lives in someone's head, backups nobody is sure ran, and that one heroic spreadsheet holding the lab together.
+Neuroscience data is a hierarchy: **project → subject → experiment → session → files**. The problem is never the data, it is everything *around* it: folders that drift apart between rigs, metadata that lives in someone's head, backups nobody is sure ran, and that one heroic spreadsheet holding the lab together.
 
 MetaMan turns that into a structure you can trust:
 
 ```text
 data_root/
-  rawData/        <project>/<experiment>/<subject>/<session>/...
-  processedData/  <project>/<experiment>/<subject>/<session>/...
+  rawData/        <project>/<subject>/<experiment>/<session>/...
+  processedData/  <project>/<subject>/<experiment>/<session>/...
 ```
 
-The hierarchy is **yours to design** (drag blocks around, see [Structure playground](#-design-your-own-hierarchy)), the metadata travels *with* the data as `json + csv + h5`, and every copy is atomic, change-aware and optionally checksum-verified.
+The hierarchy is **yours to design** (drag blocks around, see [Structure playground](#-design-your-own-hierarchy)), the metadata travels *with* the data as `json + csv + h5`, every copy is atomic and checksum-verifiable, and the whole project is one import away from a `pandas` DataFrame.
+
+> ### 🆕 New in this release
+> - 🔍 **Search workspace** - a first-class nav-rail tool to query and load any session in seconds.
+> - 🐍 **Python analysis API** - `ProjectQuery` turns a project into a tidy DataFrame for Jupyter. [Jump to it ↓](#-bonus-query-your-whole-lab-from-python)
+> - 🪄 **Metadata that scrapes itself** - open a project and MetaMan auto-detects modality, probe, sample rate, video and 384 kHz ultrasonic audio, in the background.
 
 ---
 
-## 🧭 The five-step workspace
+## 🧭 The six-stop workspace
 
 MetaMan is a single window with a violet nav rail. Each stop is one job, and they all follow the **active project** you pick at the top.
 
 | | Stop | What it does |
 |---|---|---|
 | 🗂️ | **Browse** | Walk the local + server trees, view/edit metadata at every level, right-click for dataset actions |
+| 🔍 | **Search** | Query the project (16 operators), preview results, double-click to load, export to CSV |
 | ⏺️ | **Record** | Create session metadata, auto-scrape acquisition files, write the `json/csv/h5` triplet |
 | ⚙️ | **Process** | Track preprocessing steps, parameters and results folders per session |
 | ☁️ | **Transfer** | Back up to server / external HDD, stage recordings, schedule daily jobs, read backup reports |
@@ -60,15 +67,23 @@ MetaMan is a single window with a violet nav rail. Each stop is one job, and the
 
 ### 🗂️ Browse: your whole lab as one tidy tree
 
-Local and Server tabs share the same metadata panels. Colour-coded dots mark each level (project, experiment, subject, session), and selecting a node computes live stats (sessions, files, total size, modalities) off the UI thread so the window never freezes. Right-click any node to open, reveal, rename, delete (guarded), create children, or pull a server dataset down to a local copy.
+Local and Server tabs share the same metadata panels. Colour-coded dots mark each level (project, subject, experiment, session), and selecting a node computes live stats (sessions, files, total size, modalities) off the UI thread so the window never freezes. Right-click any node to open, reveal, rename, delete (guarded), create children, or pull a server dataset down to a local copy.
 
 <p align="center">
   <img src="docs/screenshots/01_browse.png" alt="Browse tab" width="100%" />
 </p>
 
+### 🔍 Search: find any session in seconds
+
+A free-text box plus stacked `field / operator / value` conditions (AND or ANY), powered by 16 operators (`= != contains regex > between in exists ...`). Tick **"scan files"** to query derived fields like `Auto: modality` or sample rate. The results table shows subject, experiment, session and modality at a glance; the detail pane shows the full metadata; double-click loads a session straight into Record / Process; one click exports the whole result set to CSV.
+
+<p align="center">
+  <img src="docs/screenshots/08_search.png" alt="Search workspace: query builder, results table and metadata detail pane" width="100%" />
+</p>
+
 ### ⏺️ Record: metadata that writes itself (almost)
 
-Point at a session, hit **Auto-scrape**, and MetaMan reads your acquisition files to fill in modality, sample rate, channel count and the file list. Edit anything by hand, save the `json/csv/h5` triplet, and reuse a default template across sessions.
+Point at a session, hit **Auto-scrape**, and MetaMan reads your acquisition files to fill in modality, sample rate, channel count, probe, video resolution, ultrasonic audio and the file list. Edit anything by hand, save the `json/csv/h5` triplet, and reuse a default template across sessions.
 
 <p align="center">
   <img src="docs/screenshots/02_record.png" alt="Record tab" width="100%" />
@@ -115,6 +130,52 @@ Not every lab nests folders the same way. The **Structure playground** is a drag
 
 ---
 
+## 🐍 Bonus: query your whole lab from Python
+
+The Search workspace and the menu share **one Qt-free engine**, so the exact query you click in the GUI you can also run in a Jupyter notebook. It understands both metadata dialects (the canonical `metadata.json` and acquisition `*_metadata.json` files) and derives identity from the folder tree, so a stale `Subject: "rawData"` in a file can never lie to your analysis.
+
+```python
+from MetaMan.services.query import ProjectQuery
+
+pq = ProjectQuery(r"B:/NPX/rawData/mPFC-NAc", scrape=True)
+
+df = pq.to_dataframe()                 # one tidy row per session, ready for pandas
+print(pq.summary())                    # subjects, modalities, date range, % preprocessed
+
+usv = (pq.where("subject", "=", "51542")
+         .where("Auto: audio kind", "contains", "ultrasonic")
+         .where("date", "between", "2026-06-01..2026-06-30"))
+usv.to_csv("nac_51542_usv.csv")
+```
+
+Track preprocessing across the whole project too:
+
+```python
+from MetaMan.services import preprocessing_ops as pp
+
+pp.status_table(project_dir)                 # wide DataFrame: a column per step
+pp.progress_summary(project_dir)             # % complete per step + overall
+pp.pending_sessions(project_dir, "spike_sorting")
+pp.bulk_set_status(project_dir, "curation", "completed", where=("subject", "=", "51542"))
+```
+
+Full guide: [docs/analysis_api.md](docs/analysis_api.md).
+
+---
+
+## 🪄 Metadata that scrapes itself
+
+Open a project and MetaMan quietly enriches every session's metadata in the background (idempotent, so it is a no-op once everything is current). For each session it detects, without you lifting a finger:
+
+- **Neuropixels / SpikeGLX**: sample rate, channel count, probe type and serial, NI-DAQ sync;
+- **Behaviour**: video (resolution, fps, duration) and TTL / DLC tracking files;
+- **Audio**: ultrasonic `.wav` microphones (it flags 384 kHz USV rigs);
+- **Inventory**: file count, total size, file-type histogram, modified range.
+
+Toggle it under **Settings ▸ Auto-scrape metadata on open**, or force a deep pass with **🔄 Scrape project now** in the Search tab.
+
+---
+
 ## 🚀 Quick start
 
 ```bash
@@ -147,24 +208,35 @@ Moving terabytes off an acquisition machine is the scary part. MetaMan is built 
 ## 🔎 Feature deep-dive
 
 <details>
-<summary><b>🗂️ Navigation (Browse)</b></summary>
+<summary><b>🔍 Search workspace + query engine</b></summary>
 
-- Two tabs share one metadata view: **Local** (your data root) and **Server** (a network share). Both navigate the same project → experiment → subject → session hierarchy driven by each project's structure schema.
-- On the **Server** tab, point at the share holding the projects and browse it exactly like the local tree (browsing the server never changes your active local project).
-- View and edit metadata at all hierarchy levels.
-- Load subject metadata from CSV for one or multiple subjects.
-- Copy/open paths quickly.
-- **Right-click any node** for dataset actions: open, reveal, copy path, load a session into Record/Process, create a child (experiment/subject/session), **Rename** and **Delete** (guarded: type-to-confirm, recycle bin where available).
-- **Make local copy** (Server tab): right-click a server project / experiment / session and it is reconstructed under your canonical local `rawData/<project>/<experiment>/...` so you can pull data down for analysis (it appears in the Local tab immediately).
+- Quick free-text search plus up to four `field / operator / value` conditions, combined with **AND** or **ANY** (OR).
+- 16 operators: `= != contains icontains startswith endswith regex > >= < <= in "not in" between exists missing`, all case-insensitive and date-aware.
+- Optional **"scan files"** pass enriches results with `Auto:` fields so you can query modality, size and sample rate.
+- Double-click a result to load it into Record / Process; **Export CSV** writes the full result table.
+- Understands both metadata dialects and is schema-aware, so it finds sessions the old `metadata.json`-only search missed.
+- Same engine is importable from Python (`MetaMan.services.query.ProjectQuery`).
 
 </details>
 
 <details>
-<summary><b>⏺️ Recording</b></summary>
+<summary><b>🗂️ Navigation (Browse)</b></summary>
 
-- Create and update recording/session metadata.
-- Navigate the existing project hierarchy via dropdowns.
-- Auto-scrape acquisition files to infer modality, sample rate, channels and the file list.
+- Two tabs share one metadata view: **Local** (your data root) and **Server** (a network share). Both navigate the same project → subject → experiment → session hierarchy driven by each project's structure schema.
+- On the **Server** tab, point at the share holding the projects and browse it exactly like the local tree (browsing the server never changes your active local project).
+- View and edit metadata at all hierarchy levels.
+- Load subject metadata from CSV for one or multiple subjects.
+- **Right-click any node** for dataset actions: open, reveal, copy path, load a session into Record/Process, create a child, **Rename** and **Delete** (guarded: type-to-confirm, recycle bin where available).
+- **Make local copy** (Server tab): right-click a server project / experiment / session and it is reconstructed under your canonical local `rawData/...` so you can pull data down for analysis.
+
+</details>
+
+<details>
+<summary><b>⏺️ Recording &amp; 🪄 auto-scrape</b></summary>
+
+- Create and update recording/session metadata; navigate the hierarchy via dropdowns.
+- Auto-scrape acquisition files to infer modality, sample rate, channels, probe, video, ultrasonic audio and the file list.
+- Background project-wide auto-scrape on project open (idempotent), toggleable in Settings.
 - Update file list and metadata triplet outputs (`json/csv/h5`).
 
 </details>
@@ -172,44 +244,29 @@ Moving terabytes off an acquisition machine is the scary part. MetaMan is built 
 <details>
 <summary><b>⚙️ Preprocessing</b></summary>
 
-- Track preprocessing steps and completion status.
-- Store step parameters and comments.
-- Import parameters from CSV/JSON.
-- Attach per-step results folders.
+- Track preprocessing steps and completion status, store step parameters and comments.
+- Import parameters from CSV/JSON; attach per-step results folders.
+- Drive it project-wide from Python with `MetaMan.services.preprocessing_ops` (status tables, progress, bulk operations).
 
 </details>
 
 <details>
 <summary><b>📥 Data reorganizer (Import)</b></summary>
 
-- Load metadata plans (`csv/tsv/xlsx`).
-- Map columns (`subject_id`, `session_id`, `trial_id`, custom fields).
-- Match files using deterministic keys.
-- Scan **multiple raw and processed source roots**.
-- Dry run by default (safe mode).
-- Execute copy with overwrite-policy controls.
-- Generate match report, run log, and session/subject metadata outputs.
-
-MetaMan writes:
-- `experiment_plan_normalized.csv`
-- `match_report.csv`
-- `run_log.txt`
-- `subject_metadata.csv` and `subject_metadata.h5`
-- `session_metadata.csv` and `session_metadata.h5`
-
-Output roots follow `target_raw_root/<project>/<experiment>/...` and `target_processed_root/<project>/<experiment>/...`.
+- Load metadata plans (`csv/tsv/xlsx`); map columns (`subject_id`, `session_id`, `trial_id`, custom fields).
+- Match files using deterministic keys; scan **multiple raw and processed source roots**.
+- Dry run by default; execute copy with overwrite-policy controls.
+- Generate match report, run log, and session/subject metadata outputs (`experiment_plan_normalized.csv`, `match_report.csv`, `run_log.txt`, `*_metadata.csv/.h5`).
 
 </details>
 
 <details>
-<summary><b>☁️ Backup, schedule, history & reports</b></summary>
+<summary><b>☁️ Backup, schedule, history &amp; reports</b></summary>
 
-- Manual backup to **Server**, **External HDD**, or **Both**.
-- Scheduled daily backups per project, with optional experiment-level selection.
-- Last-used backup roots and schedules persisted.
+- Manual backup to **Server**, **External HDD**, or **Both**; scheduled daily backups per project with optional experiment-level selection.
 - Every backup run is recorded with full metadata: timestamp, scope, destination, duration, files copied / updated / skipped / failed / verified / pruned, bytes copied and average throughput.
 - A **Last backup** card summarises the active project's most recent run.
-- A report file (`report_<ts>.json` + readable `.txt`, plus `history.csv`) is written to `<destination>/_metaman_backup/<project>/` so the record travels with the data.
+- A report (`report_<ts>.json` + readable `.txt`, plus `history.csv`) is written to `<destination>/_metaman_backup/<project>/` so the record travels with the data.
 
 </details>
 
@@ -218,17 +275,8 @@ Output roots follow `target_raw_root/<project>/<experiment>/...` and `target_pro
 
 - Record new sessions **locally** without downloading server projects.
 - Browse the server root to pick the target project, experiment and subject.
-- Create linked recordings in a local staging area (`data_root/staging/`); each carries metadata tagging its server destination.
-- **Sync all pending** or selected recordings to the server with one click.
-- Staged recordings are also auto-synced during scheduled backups.
-- Status tracking: Pending → Synced / Error with re-queue support.
-
-</details>
-
-<details>
-<summary><b>🔍 Find Sessions (structured query)</b></summary>
-
-Run a structured query across a project's session metadata, e.g. `Region = CA1` AND `Auto: sample rate (Hz) > 30000`. Double-click a result to load it into Record / Process. Available under **Project ▸ Find Sessions...**.
+- Create linked recordings in a local staging area; each carries metadata tagging its server destination.
+- **Sync all pending** or selected recordings with one click; staged recordings are also auto-synced during scheduled backups.
 
 </details>
 
@@ -241,7 +289,7 @@ Run a structured query across a project's session metadata, e.g. `Region = CA1` 
 - **Safe by default**: dry run + no blind overwrite.
 - **Transparent operations**: logs, preview tables, match reports.
 - **Responsive UI**: background worker threads for long operations.
-- **Deterministic matching**: reproducible plan-to-file mapping.
+- **Folder is truth**: identity comes from the folder tree, so stale metadata can never mislead a query.
 
 ---
 
@@ -249,8 +297,7 @@ Run a structured query across a project's session metadata, e.g. `Region = CA1` 
 
 ```text
 MetaMan/
-  main.py            # window, menus, backup orchestration
-  config.py          # paths, defaults, constants
+  main.py            # window, menus, backup + auto-scrape orchestration
   state.py           # settings + active-project state
   io_ops.py          # metadata triplet read/write
   theme.py           # the violet workspace stylesheet
@@ -258,20 +305,24 @@ MetaMan/
   structure_designer.py
   tabs/
     navigation_tab.py
+    search_tab.py            # 🔍 the Search workspace
     recording_tab.py
     preprocessing_tab.py
     transfer_tab.py
     data_reorganizer_tab.py
     staging_tab.py
   services/
-    data_reorganizer.py
-    file_scanner.py
-    fs_ops.py
+    query.py                 # 🐍 ProjectQuery: dual-dialect, schema-aware query engine
+    preprocessing_ops.py     # project-wide preprocessing status/progress/bulk ops
+    scrape_ops.py            # idempotent project-wide auto-scrape
+    metadata_scraper.py      # per-session SpikeGLX / video / audio / TTL detection
+    search_service.py
+    structure_schema.py
     server_sync.py
     backup_report.py
     staging_service.py
-    search_service.py
-    structure_schema.py
+docs/
+  analysis_api.md            # the Python query + preprocessing guide
 ```
 
 ---
@@ -280,7 +331,7 @@ MetaMan/
 
 - Keep one canonical `data_root` with `rawData/` and `processedData/` subfolders.
 - Use the Import dry run first, then execute.
-- Save/load reorganizer configs for recurring pipelines.
+- Let auto-scrape fill the `Auto:` fields, then query on them in Search (or `ProjectQuery`).
 - Prefer an explicit `session_id` in plans when possible.
 
 ---
@@ -297,7 +348,7 @@ MetaMan/
 
 ### One-line summary
 
-**MetaMan turns scattered files and ad-hoc metadata into a structure you can trust.**
+**MetaMan turns scattered files and ad-hoc metadata into a structure you can trust, browse, search and analyse.**
 
 <sub>Made with 🧠 and a lot of violet for the BelloneLab.</sub>
 
