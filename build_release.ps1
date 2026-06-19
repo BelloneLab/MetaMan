@@ -7,8 +7,15 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
-$pythonCommand = @("python")
-if (Get-Command py -ErrorAction SilentlyContinue) {
+$pythonCommand = @()
+$activeVenvPython = if ($env:VIRTUAL_ENV) { Join-Path $env:VIRTUAL_ENV "Scripts\python.exe" } else { "" }
+$localVenvPython = Join-Path $root ".venv\Scripts\python.exe"
+
+if ($activeVenvPython -and (Test-Path -LiteralPath $activeVenvPython)) {
+    $pythonCommand = @($activeVenvPython)
+} elseif (Test-Path -LiteralPath $localVenvPython) {
+    $pythonCommand = @($localVenvPython)
+} elseif (Get-Command py -ErrorAction SilentlyContinue) {
     foreach ($version in @("-3.12", "-3.11")) {
         & py $version -c "import sys" *> $null
         if ($LASTEXITCODE -eq 0) {
@@ -16,12 +23,35 @@ if (Get-Command py -ErrorAction SilentlyContinue) {
             break
         }
     }
+} else {
+    $pythonCommand = @("python")
+}
+
+if (-not $pythonCommand) {
+    $pythonCommand = @("python")
+}
+
+Write-Host "Using Python: $($pythonCommand -join ' ')"
+
+$pythonExe = $pythonCommand[0]
+$venvRoot = Split-Path -Parent (Split-Path -Parent $pythonExe)
+$pyvenvCfg = Join-Path $venvRoot "pyvenv.cfg"
+if (Test-Path -LiteralPath $pyvenvCfg) {
+    $homeLine = Get-Content -LiteralPath $pyvenvCfg | Where-Object { $_ -match "^\s*home\s*=" } | Select-Object -First 1
+    if ($homeLine) {
+        $pythonHome = ($homeLine -split "=", 2)[1].Trim()
+        $condaLibraryBin = Join-Path $pythonHome "Library\bin"
+        if (Test-Path -LiteralPath $condaLibraryBin) {
+            $env:PATH = "$condaLibraryBin;$env:PATH"
+            Write-Host "Added Conda DLL path: $condaLibraryBin"
+        }
+    }
 }
 
 if ($pythonCommand[0] -eq "py") {
     & py $pythonCommand[1] -m PyInstaller --noconfirm --clean MetaMan.spec
 } else {
-    & python -m PyInstaller --noconfirm --clean MetaMan.spec
+    & $pythonCommand[0] -m PyInstaller --noconfirm --clean MetaMan.spec
 }
 
 if ($LASTEXITCODE -ne 0) {

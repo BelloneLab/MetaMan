@@ -11,7 +11,7 @@ Backup/schedule execution reuses the proven pipeline in ``MainWindow``.
 import os
 from typing import List
 
-from PySide6.QtCore import Qt, QTime
+from PySide6.QtCore import QObject, Qt, QTime, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -37,13 +37,20 @@ from PySide6.QtWidgets import (
 
 from ..services import fs_ops
 from ..services.backup_report import format_report_text, human_size, report_dir
+from ..services.server_sync import diff_tree
 from ..side_panel import SidePanelLayout
 from ..state import AppState
+from ..utils import run_in_thread
 from .staging_tab import StagingTab
+
+
+class _TextSignal(QObject):
+    text = Signal(str)
 
 _STATUS_COLORS = {
     "success": QColor("#1f9d57"),
     "partial": QColor("#e8a83e"),
+    "cancelled": QColor("#8b8694"),
     "error": QColor("#ed4245"),
 }
 
@@ -119,10 +126,29 @@ class TransferTab(QWidget):
         self.chk_bk_exp = QCheckBox("Back up only the current experiment")
         form.addRow("", self.chk_bk_exp)
 
+        self.chk_bk_verify = QCheckBox("Verify copies with a checksum (slower, safest)")
+        form.addRow("", self.chk_bk_verify)
+        self.chk_bk_prune = QCheckBox("Mirror: delete files at the destination that no longer exist in the source")
+        self.chk_bk_prune.setToolTip("Off = additive copy (default). On = true mirror; removed source files are deleted at the destination.")
+        form.addRow("", self.chk_bk_prune)
+
+        run_row = QHBoxLayout()
         self.btn_bk_run = QPushButton("Back up now")
         self.btn_bk_run.setObjectName("Primary")
         self.btn_bk_run.clicked.connect(self._run_backup)
-        form.addRow("", self.btn_bk_run)
+        run_row.addWidget(self.btn_bk_run)
+        self.btn_bk_preview = QPushButton("Preview changes")
+        self.btn_bk_preview.setToolTip("Dry run: show what a backup would copy/update/prune, without copying anything")
+        self.btn_bk_preview.clicked.connect(self._preview_changes)
+        run_row.addWidget(self.btn_bk_preview)
+        self.btn_bk_cancel = QPushButton("Cancel")
+        self.btn_bk_cancel.setObjectName("Danger")
+        self.btn_bk_cancel.clicked.connect(self._cancel_backup)
+        run_row.addWidget(self.btn_bk_cancel)
+        run_row.addStretch(1)
+        run_row_w = QWidget()
+        run_row_w.setLayout(run_row)
+        form.addRow("", run_row_w)
         lay.addWidget(grp)
 
         lay.addWidget(QLabel("Backup log"))
@@ -199,11 +225,78 @@ class TransferTab(QWidget):
         if self.chk_bk_exp.isChecked() and self.app_state.current_experiment:
             experiment = self.app_state.current_experiment
 
+        verify = self.chk_bk_verify.isChecked()
+        prune = self.chk_bk_prune.isChecked()
+        if prune:
+            ans = QMessageBox.question(
+                self, "Confirm mirror",
+                "Mirror mode will DELETE files at the destination that are no "
+                "longer in the source. Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                return
+
         self.txt_bk_log.clear()
         for kind, dest_root in dests:
             self.main._start_backup_copy(project, experiment=experiment,
                                          destination_root=dest_root, destination_kind=kind,
-                                         scheduled=False, log=self._append_bk_log)
+                                         scheduled=False, log=self._append_bk_log,
+                                         verify=verify, prune=prune)
+
+    def _cancel_backup(self):
+        n = self.main.cancel_running_backups()
+        self._append_bk_log(f"[cancel] Requested cancel of {n} running backup(s)." if n
+                            else "[cancel] No backup is currently running.")
+
+    def _preview_changes(self):
+        """Dry-run diff of the active project (or experiment) against the chosen
+        destination: what a backup would copy, update and (with prune) remove."""
+        project = self._active_project()
+        if not project:
+            QMessageBox.warning(self, "Preview", "Select a project first.")
+            return
+        dest_root = self.ed_bk_server.text().strip() or self.ed_bk_hdd.text().strip()
+        if not dest_root or not os.path.isdir(dest_root):
+            QMessageBox.warning(self, "Preview", "Choose an existing destination root first.")
+            return
+        experiment = ""
+        if self.chk_bk_exp.isChecked() and self.app_state.current_experiment:
+            experiment = self.app_state.current_experiment
+        if experiment:
+            source = self.main._experiment_dir(project, experiment)
+            dest = os.path.join(dest_root, project, experiment)
+        else:
+            source = self.main._resolve_project_dir(project)
+            dest = os.path.join(dest_root, project)
+        if not os.path.isdir(source):
+            QMessageBox.warning(self, "Preview", f"Local source not found:\n{source}")
+            return
+
+        self.txt_bk_log.clear()
+        self._append_bk_log(f"[preview] Comparing {source}\n          with {dest} …")
+        self._preview_sig = _TextSignal()
+        self._preview_sig.text.connect(self._append_bk_log)
+        sig = self._preview_sig
+
+        def work():
+            try:
+                d = diff_tree(source, dest)
+                lines = [
+                    f"[preview] To copy (new): {len(d['only_source'])}",
+                    f"[preview] To update (changed): {len(d['different'])}",
+                    f"[preview] Only at destination (pruned only in mirror mode): {len(d['only_dest'])}",
+                ]
+                for label, key in (("new", "only_source"), ("changed", "different"), ("dest-only", "only_dest")):
+                    for rel in d[key][:15]:
+                        lines.append(f"    [{label}] {rel}")
+                    if len(d[key]) > 15:
+                        lines.append(f"    … and {len(d[key]) - 15} more {label}")
+                sig.text.emit("\n".join(lines))
+            except Exception as exc:
+                sig.text.emit(f"[preview] Failed: {exc}")
+
+        run_in_thread(work)
 
     # ── Schedule panel ────────────────────────────────────────────────
     def _build_schedule_panel(self) -> QWidget:
@@ -237,6 +330,11 @@ class TransferTab(QWidget):
         self.chk_sc_whole.setChecked(True)
         self.chk_sc_whole.toggled.connect(lambda c: self.tbl_sc_exps.setEnabled(not c))
         form.addRow("", self.chk_sc_whole)
+
+        self.chk_sc_verify = QCheckBox("Verify copies with a checksum")
+        form.addRow("", self.chk_sc_verify)
+        self.chk_sc_prune = QCheckBox("Mirror: delete destination files no longer in the source")
+        form.addRow("", self.chk_sc_prune)
         lay.addWidget(grp)
 
         lay.addWidget(QLabel("Experiments to back up"))
@@ -312,6 +410,7 @@ class TransferTab(QWidget):
         self.app_state.settings.put_backup_schedule_for_project(
             project, enabled, self.te_sc_time.time().toString("HH:mm"),
             backup_whole_project=whole, enabled_experiments=selected, destination_mode=mode,
+            verify=self.chk_sc_verify.isChecked(), prune=self.chk_sc_prune.isChecked(),
         )
         self.refresh()
         self.lbl_sc_status.setText(
@@ -357,6 +456,8 @@ class TransferTab(QWidget):
         whole = bool(sched.get("backup_whole_project", True))
         self.chk_sc_whole.setChecked(whole)
         self.tbl_sc_exps.setEnabled(not whole)
+        self.chk_sc_verify.setChecked(bool(sched.get("verify", False)))
+        self.chk_sc_prune.setChecked(bool(sched.get("prune", False)))
         enabled_exps = set(sched.get("enabled_experiments", []) or [])
         self.tbl_sc_exps.setRowCount(0)
         for name in self._experiment_names(project):

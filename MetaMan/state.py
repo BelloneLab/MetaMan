@@ -1,10 +1,19 @@
 import json
+import logging
 import os
+import tempfile
+import threading
 from typing import Any, Dict, Optional
 from .config import (
     SETTINGS_FILE, DEFAULT_DATA_ROOT, DEFAULT_RAW_ROOT, DEFAULT_PROCESSED_ROOT,
     RAW_DIR_NAME, PROCESSED_DIR_NAME, RAW_DIR_ALIASES, PROCESSED_DIR_ALIASES,
 )
+
+log = logging.getLogger(__name__)
+
+# Bumped when the on-disk settings layout changes; ``_migrate`` upgrades older
+# files in place.
+SETTINGS_VERSION = 1
 
 
 def _sanitize_folder_name(name: str) -> str:
@@ -35,7 +44,9 @@ class AppSettings:
             "loaded_project": {},
             "structure_schema": {},
             "structure_schemas_by_project": {},
+            "_version": SETTINGS_VERSION,
         }
+        self._lock = threading.RLock()
         self.load()
         self.ensure_storage_roots()
 
@@ -123,13 +134,21 @@ class AppSettings:
         try:
             if SETTINGS_FILE.exists():
                 self._data.update(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
+            self._migrate()
             # Ensure folder-style defaults and coerce invalid legacy roots.
             data_root = self._coerce_data_root()
             self._data["data_root"] = data_root
             self._data["raw_root"] = os.path.join(data_root, self.raw_dir_name)
             self._data["processed_root"] = os.path.join(data_root, self.processed_dir_name)
         except Exception:
-            pass
+            log.exception("Failed to load settings from %s; using defaults.", SETTINGS_FILE)
+
+    def _migrate(self):
+        """Upgrade an older settings dict in place. No-op for v1; the hook keeps
+        future format changes from silently breaking existing installs."""
+        ver = int(self._data.get("_version", 0) or 0)
+        # (future migrations keyed on *ver* go here)
+        self._data["_version"] = SETTINGS_VERSION
 
     def ensure_storage_roots(self):
         data_root = self._coerce_data_root()
@@ -150,10 +169,33 @@ class AppSettings:
         self.save()
 
     def save(self):
-        try:
-            SETTINGS_FILE.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        """Persist settings atomically and thread-safely.
+
+        Writes to a temp file in the same directory then ``os.replace``s it over
+        the target, so a crash or concurrent writer can never leave a truncated
+        settings file. The lock serialises writers from worker threads (e.g. a
+        scheduled-backup mark running while the GUI records a run)."""
+        with self._lock:
+            try:
+                payload = json.dumps(self._data, indent=2)
+                target = str(SETTINGS_FILE)
+                os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+                fd, tmp = tempfile.mkstemp(
+                    prefix=".settings_", suffix=".tmp",
+                    dir=os.path.dirname(target) or ".",
+                )
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(payload)
+                    os.replace(tmp, target)
+                finally:
+                    if os.path.exists(tmp):
+                        try:
+                            os.remove(tmp)
+                        except Exception:
+                            pass
+            except Exception:
+                log.exception("Failed to save settings to %s", SETTINGS_FILE)
 
     @property
     def raw_root(self) -> str:
@@ -247,6 +289,8 @@ class AppSettings:
             "enabled_experiments": [str(x) for x in enabled_exps if str(x).strip()],
             "run_dates_by_experiment": {str(k): str(v) for k, v in run_dates.items()},
             "destination_mode": str(raw.get("destination_mode", "server") or "server"),
+            "verify": bool(raw.get("verify", False)),
+            "prune": bool(raw.get("prune", False)),
         }
 
     def get_all_backup_schedules(self) -> Dict[str, Dict[str, Any]]:
@@ -271,6 +315,8 @@ class AppSettings:
                 "enabled_experiments": [str(x) for x in enabled_exps if str(x).strip()],
                 "run_dates_by_experiment": {str(k): str(v) for k, v in run_dates.items()},
                 "destination_mode": str(raw.get("destination_mode", "server") or "server"),
+                "verify": bool(raw.get("verify", False)),
+                "prune": bool(raw.get("prune", False)),
             }
         return out
 
@@ -282,6 +328,8 @@ class AppSettings:
         backup_whole_project: bool = True,
         enabled_experiments: Optional[list] = None,
         destination_mode: str = "server",
+        verify: bool = False,
+        prune: bool = False,
     ):
         schedules = self._data.setdefault("backup_schedules_by_project", {})
         prev = schedules.get(project, {}) if isinstance(schedules, dict) else {}
@@ -299,6 +347,8 @@ class AppSettings:
             "enabled_experiments": [str(x) for x in exps if str(x).strip()],
             "run_dates_by_experiment": {str(k): str(v) for k, v in prev_run_dates.items()},
             "destination_mode": str(destination_mode or "server"),
+            "verify": bool(verify),
+            "prune": bool(prune),
         }
         self.save()
 
@@ -321,6 +371,8 @@ class AppSettings:
             "enabled_experiments": [str(x) for x in exps if str(x).strip()],
             "run_dates_by_experiment": {str(k): str(v) for k, v in run_dates.items()},
             "destination_mode": str(prev.get("destination_mode", "server") or "server"),
+            "verify": bool(prev.get("verify", False)),
+            "prune": bool(prev.get("prune", False)),
         }
         self.save()
 

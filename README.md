@@ -93,14 +93,37 @@ python run_app.py
 
 ### Backup history & reports (Transfer ▸ History)
 - Every backup run is recorded with full metadata: timestamp, scope,
-  destination, duration, files copied / updated / skipped / failed, bytes copied
-  and average throughput
+  destination, duration, files copied / updated / skipped / failed / verified /
+  pruned, bytes copied and average throughput
 - A **Last backup** card summarises the active project's most recent run
 - A report file (`report_<ts>.json` + readable `.txt`, plus `history.csv`) is
   written to `<destination>/_metaman_backup/<project>/` so the record travels
   with the data
-- Copies are change-aware: an unchanged file is **skipped**, a same-name file
-  whose source is newer/different is **updated**
+
+### Safe copying
+- **Atomic writes**: files are written to a temporary `.mmpart` then renamed, so
+  an interrupted run never leaves a truncated file at the real path
+- **Change-aware**: an unchanged file is **skipped**, a same-name file whose
+  source is newer/different is **updated** (size + modification time)
+- **Verify** (opt-in): re-reads each copy and compares a SHA-256 checksum
+- **Mirror / prune** (opt-in, off by default): also deletes destination files
+  that no longer exist in the source. Without it, backup is a safe additive copy
+- **Free-space precheck**: a backup that cannot fit is refused before it starts
+- **Cancel**: long copies/backups can be stopped, and closing the app stops any
+  in-flight job cleanly
+- **Preview changes**: a dry run shows what a backup would copy / update / prune
+  without copying anything
+- A structure sidecar (`_metaman_structure.json`) is written at the project root
+  so a backed-up project carries its folder schema to the server
+
+### Find Sessions (Project ▸ Find Sessions…)
+- Structured query across a project's session metadata, e.g.
+  `Region = CA1` AND `Auto: sample rate (Hz) > 30000`. Double-click a result to
+  load it into Record / Process.
+
+> Operational notes: actions and errors are logged to `~/.metaman/metaman.log`;
+> settings are saved atomically. NWB / BIDS export is **not** included yet (it
+> needs a dedicated data-mapping design and the `pynwb` dependency).
 
 ### Staging tab (linked recordings)
 - Record new sessions **locally** without downloading server projects

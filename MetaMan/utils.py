@@ -2,6 +2,48 @@ import threading
 from typing import Callable
 from PySide6.QtCore import QObject, Signal
 
+# ── cooperative cancellation ───────────────────────────────────────────────
+# Long copy/backup jobs run on daemon threads. A CancelToken lets the UI (or a
+# graceful app shutdown) ask a running job to stop at the next file boundary so
+# it never leaves a half-written file behind.
+
+_ACTIVE_TOKENS: set = set()
+_ACTIVE_LOCK = threading.Lock()
+
+
+class CancelToken:
+    """A thread-safe cancel flag registered globally so app shutdown can signal
+    every in-flight job at once."""
+
+    def __init__(self):
+        self._ev = threading.Event()
+        with _ACTIVE_LOCK:
+            _ACTIVE_TOKENS.add(self)
+
+    def cancel(self):
+        self._ev.set()
+
+    def is_cancelled(self) -> bool:
+        return self._ev.is_set()
+
+    def done(self):
+        with _ACTIVE_LOCK:
+            _ACTIVE_TOKENS.discard(self)
+
+
+def cancel_all_jobs():
+    """Signal every active CancelToken (used on graceful shutdown)."""
+    with _ACTIVE_LOCK:
+        tokens = list(_ACTIVE_TOKENS)
+    for t in tokens:
+        t.cancel()
+
+
+def active_job_count() -> int:
+    with _ACTIVE_LOCK:
+        return len(_ACTIVE_TOKENS)
+
+
 class LogEmitter(QObject):
     append_line = Signal(str)
 

@@ -43,6 +43,8 @@ def build_record(
     failed = int(stats.get("failed", 0) or 0)
     if error:
         status = "error"
+    elif stats.get("cancelled"):
+        status = "cancelled"
     elif failed:
         status = "partial"
     else:
@@ -67,6 +69,10 @@ def build_record(
         "updated": int(stats.get("updated", 0) or 0),
         "skipped": int(stats.get("skipped", 0) or 0),
         "failed": failed,
+        "verified": int(stats.get("verified", 0) or 0),
+        "verify_failed": int(stats.get("verify_failed", 0) or 0),
+        "pruned": int(stats.get("pruned", 0) or 0),
+        "cancelled": bool(stats.get("cancelled", False)),
         "bytes_copied": int(stats.get("bytes_copied", 0) or 0),
         "bytes_total": int(stats.get("bytes_total", 0) or 0),
         "avg_mbps": float(stats.get("avg_mbps", 0.0) or 0.0),
@@ -111,6 +117,9 @@ def format_report_text(record: Dict[str, Any]) -> str:
         f"  updated      : {record.get('updated', 0)}",
         f"  skipped      : {record.get('skipped', 0)}",
         f"  failed       : {record.get('failed', 0)}",
+        f"  verified     : {record.get('verified', 0)}"
+        + (f" ({record.get('verify_failed', 0)} mismatched)" if record.get('verify_failed') else ""),
+        f"  pruned       : {record.get('pruned', 0)}",
         f"Data copied    : {human_size(record.get('bytes_copied', 0))}"
         f"  (of {human_size(record.get('bytes_total', 0))} scanned)",
         f"Avg throughput : {record.get('avg_mbps', 0)} MB/s",

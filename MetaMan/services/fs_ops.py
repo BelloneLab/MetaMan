@@ -11,7 +11,9 @@ import os
 import sys
 from typing import Any, Callable, Dict, Optional
 
-from .server_sync import copy_with_progress, mirror_tree, new_stats, _now_iso
+from .server_sync import (
+    CopyCancelled, VerificationError, copy_with_progress, mirror_tree, new_stats, _now_iso,
+)
 
 _BAD_NAME_CHARS = '<>:"/\\|?*'
 
@@ -127,12 +129,14 @@ def delete_path(path: str, permanent: bool = False) -> str:
 # ── copying (file or folder) ────────────────────────────────────────────────
 
 def copy_into(src: str, dest_dir: str, log: Callable[[str], None],
-              stats: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+              stats: Optional[Dict[str, Any]] = None,
+              *, cancel=None, verify: bool = False) -> Dict[str, Any]:
     """Copy *src* (a file or folder) into *dest_dir*, preserving its basename.
 
     Folders are mirrored via :func:`server_sync.mirror_tree`; single files via
-    :func:`server_sync.copy_with_progress`. Returns the copy-statistics dict so
-    callers can build a report identical to the backup path.
+    :func:`server_sync.copy_with_progress`. *cancel* (a CancelToken) and
+    *verify* (post-copy checksum) are forwarded. Returns the copy-statistics
+    dict so callers can build a report identical to the backup path.
     """
     import time
 
@@ -145,7 +149,7 @@ def copy_into(src: str, dest_dir: str, log: Callable[[str], None],
         if not s["started_at"]:
             s["started_at"] = _now_iso()
         started = time.time()
-        mirror_tree(src, target, log, stats=s)
+        mirror_tree(src, target, log, stats=s, cancel=cancel, verify=verify)
         s["finished_at"] = _now_iso()
         dt = max(time.time() - started, 1e-6)
         s["duration_s"] = round(dt, 3)
@@ -165,12 +169,22 @@ def copy_into(src: str, dest_dir: str, log: Callable[[str], None],
     s["files_total"] += 1
     s["bytes_total"] += size
     try:
-        copied, _bps = copy_with_progress(src, target, log)
+        copied, _bps = copy_with_progress(src, target, log, cancel=cancel, verify=verify)
         if copied:
             s["copied"] += 1
             s["bytes_copied"] += size
+            if verify:
+                s["verified"] += 1
         else:
             s["skipped"] += 1
+    except CopyCancelled:
+        s["cancelled"] = True
+        log("[cancelled] Copy stopped before completion.")
+    except VerificationError as exc:
+        s["failed"] += 1
+        s["verify_failed"] += 1
+        s["errors"].append({"path": base, "message": str(exc)})
+        log(f"[error] {exc}")
     except Exception as exc:
         s["failed"] += 1
         s["errors"].append({"path": base, "message": str(exc)})

@@ -2,25 +2,21 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QTime, Signal, QObject
+from PySide6.QtCore import Qt, Signal, QObject
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QCheckBox,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QSplitter,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
-    QTimeEdit,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -40,15 +36,15 @@ from ..io_ops import (
     save_subject_info,
     load_session_metadata,
     save_session_triplet,
+    load_structure_sidecar,
 )
 from ..state import AppState
 from ..utils import run_in_thread
 from ..services import fs_ops
-from ..services.server_sync import sync_project_to_server
 from ..services.staging_service import server_raw_root
 from ..services.structure_schema import (
     sublevels, is_marker_level, marker_folder_name, level_meta_key, level_label,
-    LEVEL_COLORS, META_KEY_FOR_LEVEL,
+    normalize_structure_schema, LEVEL_COLORS, META_KEY_FOR_LEVEL,
 )
 from ..services.metadata_scraper import scrape_session, merge_auto, classify_modality, is_probably_local
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
@@ -212,6 +208,10 @@ class _SyncEmitter(QObject):
     finished = Signal(bool, str)   # ok, message
 
 
+class _StatsEmitter(QObject):
+    ready = Signal(int, str, dict)  # seq, node_path, stats
+
+
 # ── NavigationTab ──────────────────────────────────────────────────
 
 class NavigationTab(QWidget):
@@ -224,10 +224,6 @@ class NavigationTab(QWidget):
         self.on_load_session = on_load_session
         self.on_activate_project = on_activate_project
         self.on_local_changed = on_local_changed
-        self._sync_running = False
-        self._sync_emitter = _SyncEmitter()
-        self._sync_emitter.log_line.connect(self._on_sync_log)
-        self._sync_emitter.finished.connect(self._on_sync_finished)
         # Server tab + local-copy worker state
         self._server_display_root = ""
         self._server_base = ""
@@ -235,6 +231,12 @@ class NavigationTab(QWidget):
         self._copy_emitter = _SyncEmitter()
         self._copy_emitter.log_line.connect(self._on_copy_log)
         self._copy_emitter.finished.connect(self._on_copy_finished)
+        # Background stats: node selection never blocks on a full session walk.
+        self._stats_cache = {}
+        self._stats_seq = 0
+        self._pending_stats = None
+        self._stats_emitter = _StatsEmitter()
+        self._stats_emitter.ready.connect(self._on_stats_ready)
         self._build_ui()
         self.refresh_tree(collapsed=True, lazy=True)
         saved = self.app_state.settings.get_explorer_settings().get("server_root", "")
@@ -422,316 +424,6 @@ class NavigationTab(QWidget):
         self.tbl_session.customContextMenuRequested.connect(self._session_table_context_menu)
         self.tbl_session.installEventFilter(self)
 
-    def _build_project_tab(self, w):
-        lay = QVBoxLayout(w)
-
-        # ── Load project ──────────────────────────────────────────
-        grp_load = QGroupBox("Load Project")
-        gl = QVBoxLayout(grp_load)
-
-        btn_row = QHBoxLayout()
-        b_local = QPushButton("Load Local Project\u2026")
-        b_local.setToolTip("Browse to a local project folder")
-        b_local.clicked.connect(self._load_local_project)
-        btn_row.addWidget(b_local)
-        b_server = QPushButton("Load Server Project\u2026")
-        b_server.setToolTip("Browse to a project on a server / network drive")
-        b_server.clicked.connect(self._load_server_project)
-        btn_row.addWidget(b_server)
-        gl.addLayout(btn_row)
-
-        form = QFormLayout()
-        self.lbl_loaded_name = QLabel("-")
-        self.lbl_loaded_name.setStyleSheet("font-weight: 600; font-size: 12px;")
-        form.addRow("Project:", self.lbl_loaded_name)
-        self.lbl_loaded_source = QLabel("-")
-        self.lbl_loaded_source.setWordWrap(True)
-        form.addRow("Source:", self.lbl_loaded_source)
-        self.lbl_loaded_type = QLabel("-")
-        form.addRow("Type:", self.lbl_loaded_type)
-        gl.addLayout(form)
-        lay.addWidget(grp_load)
-
-        # ── Destination ───────────────────────────────────────────
-        grp_dest = QGroupBox("Local Destination")
-        gd = QVBoxLayout(grp_dest)
-        gd.addWidget(QLabel("Where new recordings are stored locally:"))
-        dest_row = QHBoxLayout()
-        self.ed_proj_dest = QLineEdit()
-        self.ed_proj_dest.setPlaceholderText("e.g. D:\\data\\raw\\MyProject")
-        dest_row.addWidget(self.ed_proj_dest, 1)
-        b_dest = QPushButton("Browse\u2026")
-        b_dest.clicked.connect(self._browse_destination)
-        dest_row.addWidget(b_dest)
-        gd.addLayout(dest_row)
-        b_save_dest = QPushButton("Save")
-        b_save_dest.clicked.connect(self._save_project_settings)
-        gd.addWidget(b_save_dest)
-        lay.addWidget(grp_dest)
-
-        # ── Backup ────────────────────────────────────────────────
-        grp_backup = QGroupBox("Backup to Server")
-        gb = QVBoxLayout(grp_backup)
-
-        self.lbl_backup_status = QLabel("Load a project to configure backup.")
-        self.lbl_backup_status.setWordWrap(True)
-        gb.addWidget(self.lbl_backup_status)
-
-        srv_row = QHBoxLayout()
-        srv_row.addWidget(QLabel("Server path:"))
-        self.ed_server_path = QLineEdit()
-        self.ed_server_path.setPlaceholderText("\\\\server\\share  or  Z:\\backups")
-        srv_row.addWidget(self.ed_server_path, 1)
-        b_srv = QPushButton("Browse\u2026")
-        b_srv.clicked.connect(self._browse_server_path)
-        srv_row.addWidget(b_srv)
-        gb.addLayout(srv_row)
-
-        self.btn_sync = QPushButton("Backup project to server")
-        self.btn_sync.setObjectName("Primary")
-        self.btn_sync.clicked.connect(self._sync_to_server)
-        gb.addWidget(self.btn_sync)
-
-        self.sync_progress = QProgressBar()
-        self.sync_progress.setRange(0, 0)
-        self.sync_progress.setVisible(False)
-        gb.addWidget(self.sync_progress)
-
-        self.txt_sync_log = QTextEdit()
-        self.txt_sync_log.setReadOnly(True)
-        self.txt_sync_log.setMaximumHeight(120)
-        self.txt_sync_log.setPlaceholderText("Backup log...")
-        gb.addWidget(self.txt_sync_log)
-        lay.addWidget(grp_backup)
-
-        # ── Scheduled auto-backup ─────────────────────────────────
-        grp_sched = QGroupBox("Scheduled Auto-Backup")
-        gs = QVBoxLayout(grp_sched)
-
-        self.chk_auto_backup = QCheckBox("Enable daily auto-backup")
-        gs.addWidget(self.chk_auto_backup)
-
-        time_row = QHBoxLayout()
-        time_row.addWidget(QLabel("Time:"))
-        self.te_backup_time = QTimeEdit()
-        self.te_backup_time.setDisplayFormat("HH:mm")
-        self.te_backup_time.setTime(QTime(2, 0))
-        time_row.addWidget(self.te_backup_time)
-        time_row.addStretch(1)
-        gs.addLayout(time_row)
-
-        self.lbl_sched_status = QLabel("")
-        self.lbl_sched_status.setWordWrap(True)
-        gs.addWidget(self.lbl_sched_status)
-
-        b_save_sched = QPushButton("Save schedule")
-        b_save_sched.clicked.connect(self._save_auto_backup_schedule)
-        gs.addWidget(b_save_sched)
-
-        lay.addWidget(grp_sched)
-
-        lay.addStretch(1)
-
-        # populate from saved settings
-        self._refresh_project_tab()
-
-    # ── project actions ───────────────────────────────────────────
-
-    def _load_local_project(self):
-        d = QFileDialog.getExistingDirectory(self, "Choose local project folder",
-                                             self.app_state.settings.raw_root)
-        if not d:
-            return
-        name = os.path.basename(os.path.normpath(d))
-        self.app_state.settings.put_loaded_project(name, d, "local", d)
-        self._refresh_project_tab()
-        self.refresh_tree(collapsed=True, lazy=True)
-
-    def _load_server_project(self):
-        d = QFileDialog.getExistingDirectory(self, "Choose server project folder")
-        if not d:
-            return
-        name = os.path.basename(os.path.normpath(d))
-        # Default local destination = raw_root / project_name
-        dest = os.path.join(self.app_state.settings.raw_root, name)
-        # Auto-link server backup path = parent of project folder
-        server_parent = os.path.dirname(os.path.normpath(d))
-        self.app_state.settings.put_server_root_for_project(name, server_parent)
-        self.app_state.settings.put_loaded_project(name, d, "server", dest)
-        self._refresh_project_tab()
-        self.refresh_tree(collapsed=True, lazy=True)
-
-    def _browse_destination(self):
-        d = QFileDialog.getExistingDirectory(self, "Choose local destination",
-                                             self.ed_proj_dest.text() or "")
-        if d:
-            self.ed_proj_dest.setText(d)
-
-    def _browse_server_path(self):
-        d = QFileDialog.getExistingDirectory(self, "Choose server folder",
-                                             self.ed_server_path.text() or "")
-        if d:
-            self.ed_server_path.setText(d)
-
-    def _save_project_settings(self):
-        proj = self.app_state.settings.get_loaded_project()
-        name = proj["name"]
-        if not name:
-            QMessageBox.warning(self, "Save", "Load a project first.")
-            return
-        dest = self.ed_proj_dest.text().strip()
-        self.app_state.settings.put_loaded_project(
-            name, proj["source_path"], proj["source_type"], dest
-        )
-        srv = self.ed_server_path.text().strip()
-        if srv:
-            self.app_state.settings.put_server_root_for_project(name, srv)
-        self._refresh_project_tab()
-        QMessageBox.information(self, "Saved", f"Settings saved for '{name}'.")
-
-    def _refresh_project_tab(self):
-        proj = self.app_state.settings.get_loaded_project()
-        name = proj["name"]
-        if name:
-            self.lbl_loaded_name.setText(name)
-            self.lbl_loaded_source.setText(proj["source_path"])
-            self.lbl_loaded_type.setText(proj["source_type"] or "local")
-            self.ed_proj_dest.setText(proj["destination_path"])
-            srv = self.app_state.settings.get_server_root_for_project(name)
-            self.ed_server_path.setText(srv)
-            if srv:
-                self.lbl_backup_status.setText(f"Ready: {name} \u2192 {srv}")
-            else:
-                self.lbl_backup_status.setText("Set a server path for backup.")
-            # schedule
-            sched = self.app_state.settings.get_backup_schedule_for_project(name)
-            self.chk_auto_backup.setChecked(bool(sched.get("enabled", False)))
-            hhmm = str(sched.get("time", "")).strip() or "02:00"
-            qt = QTime.fromString(hhmm, "HH:mm")
-            if not qt.isValid():
-                qt = QTime(2, 0)
-            self.te_backup_time.setTime(qt)
-            if sched.get("enabled"):
-                last = sched.get("last_run_date", "never")
-                self.lbl_sched_status.setText(
-                    f"Auto-backup enabled at {hhmm}.  Last run: {last}"
-                )
-            else:
-                self.lbl_sched_status.setText("Auto-backup is disabled.")
-        else:
-            self.lbl_loaded_name.setText("-")
-            self.lbl_loaded_source.setText("-")
-            self.lbl_loaded_type.setText("-")
-            self.lbl_backup_status.setText("Load a project first.")
-            self.chk_auto_backup.setChecked(False)
-            self.lbl_sched_status.setText("")
-
-    def _save_auto_backup_schedule(self):
-        proj = self.app_state.settings.get_loaded_project()
-        name = proj["name"]
-        if not name:
-            QMessageBox.warning(self, "Schedule", "Load a project first.")
-            return
-        srv = self.ed_server_path.text().strip()
-        if self.chk_auto_backup.isChecked() and not srv:
-            QMessageBox.warning(
-                self, "Schedule",
-                "Set a server path before enabling auto-backup."
-            )
-            return
-        if self.chk_auto_backup.isChecked() and not os.path.isdir(srv):
-            QMessageBox.warning(
-                self, "Schedule",
-                f"Server path not accessible:\n{srv}"
-            )
-            return
-
-        enabled = self.chk_auto_backup.isChecked()
-        time_hhmm = self.te_backup_time.time().toString("HH:mm")
-
-        if srv:
-            self.app_state.settings.put_server_root_for_project(name, srv)
-
-        self.app_state.settings.put_backup_schedule_for_project(
-            name,
-            enabled,
-            time_hhmm,
-            backup_whole_project=True,
-            enabled_experiments=[],
-            destination_mode="server",
-        )
-
-        self._refresh_project_tab()
-        state = "enabled" if enabled else "disabled"
-        QMessageBox.information(
-            self, "Schedule",
-            f"Auto-backup {state} for '{name}' at {time_hhmm}."
-        )
-
-    # ── backup (sync local → server) ──────────────────────────────
-
-    def _sync_to_server(self):
-        proj = self.app_state.settings.get_loaded_project()
-        name = proj["name"]
-        dest = proj["destination_path"]
-        if not name or not dest:
-            QMessageBox.warning(self, "Backup", "Load a project first.")
-            return
-        if not os.path.isdir(dest):
-            QMessageBox.critical(self, "Backup", f"Local destination not found:\n{dest}")
-            return
-        server_root = self.ed_server_path.text().strip()
-        if not server_root:
-            QMessageBox.warning(self, "Backup", "Set a server path first.")
-            return
-        if not os.path.isdir(server_root):
-            QMessageBox.critical(
-                self, "Backup",
-                f"Server path not accessible:\n{server_root}\n\n"
-                "Check that the network drive is mounted."
-            )
-            return
-
-        # Save server path if changed
-        self.app_state.settings.put_server_root_for_project(name, server_root)
-
-        self._sync_running = True
-        self.btn_sync.setEnabled(False)
-        self.btn_sync.setText(f"Backing up {name}\u2026")
-        self.sync_progress.setVisible(True)
-        self.txt_sync_log.clear()
-        self.lbl_backup_status.setText(f"Syncing {name} \u2192 {server_root}")
-
-        emitter = self._sync_emitter
-
-        def work():
-            try:
-                sync_project_to_server(
-                    dest, server_root,
-                    lambda msg: emitter.log_line.emit(msg),
-                    dest_name=name,
-                )
-                emitter.finished.emit(True, f"Backup complete: {name}")
-            except Exception as e:
-                emitter.finished.emit(False, f"Backup failed: {e}")
-
-        run_in_thread(work)
-
-    def _on_sync_log(self, msg: str):
-        self.txt_sync_log.append(msg)
-
-    def _on_sync_finished(self, ok: bool, message: str):
-        self._sync_running = False
-        self.btn_sync.setEnabled(True)
-        self.btn_sync.setText("Backup project to server")
-        self.sync_progress.setVisible(False)
-        self.lbl_backup_status.setText(message)
-        if ok:
-            self.txt_sync_log.append("\n--- Backup completed successfully ---")
-        else:
-            self.txt_sync_log.append(f"\n--- {message} ---")
-            QMessageBox.critical(self, "Backup failed", message)
-
     # ── tree ──────────────────────────────────────────────────────
 
     def _make_tree(self) -> QTreeWidget:
@@ -780,6 +472,7 @@ class NavigationTab(QWidget):
         self._set_server_root(self.ed_server_root.text().strip())
 
     def _build_server_tree(self):
+        self._stats_cache.clear()
         self.server_tree.clear()
         base = self._server_base
         if not base or not os.path.isdir(base):
@@ -872,19 +565,9 @@ class NavigationTab(QWidget):
         if not ok:
             QMessageBox.warning(self, "Make local copy", msg)
 
-    def _choose_root(self):
-        d = QFileDialog.getExistingDirectory(self, "Choose data root", self.ed_root.text() or "")
-        if not d:
-            return
-        d = canon_path(d)
-        self.ed_root.setText(d)
-        self.app_state.settings.data_root = d
-        os.makedirs(self.app_state.settings.raw_root, exist_ok=True)
-        os.makedirs(self.app_state.settings.processed_root, exist_ok=True)
-        self.refresh_tree(collapsed=True, lazy=True)
-
     def refresh_tree(self, collapsed=True, lazy=True):
         """Rebuild the *local* projects tree from the raw root."""
+        self._stats_cache.clear()
         self.local_tree.clear()
         self.app_state.settings.ensure_storage_roots()
         raw_root = self.app_state.settings.raw_root
@@ -941,6 +624,13 @@ class NavigationTab(QWidget):
     # ── schema-driven traversal ───────────────────────────────────
 
     def _project_sublevels(self, project: str) -> List[dict]:
+        # Prefer a structure sidecar inside the project folder (so a server
+        # project renders with its real hierarchy, not the local default); fall
+        # back to the per-name schema from settings.
+        proj_dir = os.path.join(self._active_base(), project)
+        sidecar = load_structure_sidecar(proj_dir)
+        if sidecar:
+            return sublevels(normalize_structure_schema(sidecar), "raw")
         schema = self.app_state.settings.resolve_structure_schema(project)
         return sublevels(schema, "raw")
 
@@ -1054,9 +744,9 @@ class NavigationTab(QWidget):
                 self.app_state.settings.last_opened_project = project
             self._browse_set_current(project=project, experiment="", animal="", session="", session_path="")
             info = self._without_stat_keys(load_project_info(path))
-            dict_to_table(self.tbl_proj, {**humanize_stats(self._stats_for(project, path, 0)), **info})
             self.lbl_proj.setText(project); self.lbl_proj_path.setText(path)
             self.right_tabs.setCurrentIndex(0)
+            self._fill_info_with_stats(self.tbl_proj, info, project, path, 0)
             return
 
         if ctx["is_leaf"]:
@@ -1087,18 +777,18 @@ class NavigationTab(QWidget):
             self._browse_set_current(project=project, experiment=os.path.basename(path),
                                      animal="", session="", session_path="")
             info = self._without_stat_keys(load_experiment_info(path))
-            dict_to_table(self.tbl_exp, {**humanize_stats(self._stats_for(project, path, idx + 1)), **info})
             self.lbl_exp.setText(os.path.basename(path)); self.lbl_exp_path.setText(path)
             self.right_tabs.setCurrentIndex(1)
+            self._fill_info_with_stats(self.tbl_exp, info, project, path, idx + 1)
             return
 
         if kind == "subject":
             self._browse_set_current(project=project, experiment=experiment,
                                      animal=os.path.basename(path), session="", session_path="")
             info = self._without_stat_keys(load_subject_info(path))
-            dict_to_table(self.tbl_sub, {**humanize_stats(self._stats_for(project, path, idx + 1)), **info})
             self.lbl_sub.setText(os.path.basename(path)); self.lbl_sub_path.setText(path)
             self.right_tabs.setCurrentIndex(2)
+            self._fill_info_with_stats(self.tbl_sub, info, project, path, idx + 1)
             return
 
         # Intermediate non-core level (recording / trial / marker): track context only.
@@ -1111,6 +801,37 @@ class NavigationTab(QWidget):
         if self._server_active():
             return
         self.app_state.set_current(**kwargs)
+
+    def _fill_info_with_stats(self, table, info, project, node_path, start_index):
+        """Show *info* immediately and compute the (potentially expensive) stats
+        off the UI thread, caching the result. Selecting a project with thousands
+        of sessions no longer freezes the window."""
+        key = (node_path, self._active_base())
+        cached = self._stats_cache.get(key)
+        if cached is not None:
+            dict_to_table(table, {**humanize_stats(cached), **info})
+            return
+        dict_to_table(table, {**{"Stats": "computing…"}, **info})
+        self._stats_seq += 1
+        seq = self._stats_seq
+        self._pending_stats = {"seq": seq, "key": key, "table": table, "info": info}
+        emitter = self._stats_emitter
+
+        def work():
+            try:
+                stats = self._stats_for(project, node_path, start_index)
+            except Exception:
+                stats = {}
+            emitter.ready.emit(seq, node_path, stats)
+
+        run_in_thread(work)
+
+    def _on_stats_ready(self, seq: int, node_path: str, stats: dict):
+        p = self._pending_stats
+        if not p or p["seq"] != seq:
+            return  # selection moved on; drop this stale result
+        self._stats_cache[p["key"]] = stats
+        dict_to_table(p["table"], {**humanize_stats(stats), **p["info"]})
 
     # ── stats (schema-driven) ─────────────────────────────────────
 
@@ -1505,12 +1226,27 @@ class NavigationTab(QWidget):
         def last5(x):
             s = str(x); return s[-5:] if len(s) >= 5 else s
 
+        def norm(x):
+            return str(x).strip().lower()
+
+        df["_IDFULL"] = df[id_col].map(norm)
         df["_ID5"] = df[id_col].map(last5)
+
+        def find_match(name):
+            """Prefer an exact (normalised) full-ID match; only fall back to the
+            last-5-characters heuristic when it is unambiguous."""
+            exact = df[df["_IDFULL"] == norm(name)]
+            if not exact.empty:
+                return exact.iloc[0].to_dict()
+            cand = df[df["_ID5"] == last5(name)]
+            if len(cand) == 1:
+                return cand.iloc[0].to_dict()
+            return None  # no match, or an ambiguous last-5 collision
 
         def row_to_info(row):
             info = {}
             for k, v in row.items():
-                if k == "_ID5": continue
+                if k in ("_ID5", "_IDFULL"): continue
                 try:
                     if isinstance(v, float) and v != v: v = ""
                 except Exception: pass
@@ -1522,19 +1258,19 @@ class NavigationTab(QWidget):
             updated = 0
             for sub_dir in self._iter_level_dirs(project_name, "subject"):
                 subject = os.path.basename(sub_dir)
-                matches = df[df["_ID5"] == last5(subject)]
-                if matches.empty: continue
+                row = find_match(subject)
+                if row is None: continue
                 existing = load_subject_info(sub_dir)
-                existing.update(row_to_info(matches.iloc[0].to_dict()))
+                existing.update(row_to_info(row))
                 save_subject_info(sub_dir, existing); updated += 1
             QMessageBox.information(self, "Import complete", f"Updated {updated} subjects in project.")
         else:
             updated = 0; unmatched: List[str] = []
             for path, text in subjects:
-                matches = df[df["_ID5"] == last5(text)]
-                if matches.empty: unmatched.append(text); continue
+                row = find_match(text)
+                if row is None: unmatched.append(text); continue
                 existing = load_subject_info(path)
-                existing.update(row_to_info(matches.iloc[0].to_dict()))
+                existing.update(row_to_info(row))
                 save_subject_info(path, existing); updated += 1
             total = len(subjects)
             if updated == 0:

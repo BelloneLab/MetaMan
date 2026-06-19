@@ -20,7 +20,10 @@ a = Analysis(
     pathex=[str(project_root)],
     binaries=[],
     datas=datas,
-    hiddenimports=[],
+    # send2trash is imported lazily (recycle-bin deletes) so PyInstaller cannot
+    # see it via static analysis; name it explicitly or the frozen build would
+    # silently fall back to permanent deletes.
+    hiddenimports=["send2trash"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

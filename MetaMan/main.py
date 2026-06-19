@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 from datetime import datetime
@@ -31,13 +32,19 @@ from .tabs.data_reorganizer_tab import DataReorganizerTab
 from .tabs.transfer_tab import TransferTab
 from .project_bar import ProjectContextBar
 from .nav_rail import WorkspaceShell
-from .services.server_sync import sync_project_to_server
+from .services.server_sync import sync_project_to_server, tree_size, free_space
 from .services.backup_report import build_record, write_report_files
 from .services.staging_service import load_manifest, sync_pending
 from .theme import STYLESHEET, FONT_FAMILY
-from .services.search_service import search_in_project
-from .io_ops import list_experiments, list_projects, load_session_metadata, save_session_triplet
-from .utils import run_in_thread
+from .services.search_service import search_in_project, query_sessions, OPERATORS
+from .io_ops import (
+    list_experiments, list_projects, load_session_metadata, save_session_triplet,
+    save_structure_sidecar,
+)
+from .utils import run_in_thread, cancel_all_jobs, CancelToken
+from .logging_setup import setup_logging
+
+app_log = logging.getLogger(__name__)
 from .structure_designer import StructureDesignerDialog
 from .services.structure_schema import default_structure_schema, normalize_structure_schema
 
@@ -127,6 +134,7 @@ class MainWindow(QMainWindow):
                 self.setWindowIcon(icon)
         self.state = AppState()
         self._backup_jobs_in_progress = set()
+        self._backup_cancel = {}  # job_key -> CancelToken for in-flight backups
         self._schedule_warning_cache = set()
         self._backup_emitter = _BackupEmitter()
         self._backup_emitter.run_recorded.connect(self._on_backup_run_recorded)
@@ -208,6 +216,7 @@ class MainWindow(QMainWindow):
         add(menu_proj, "\U0001f5c4️  Make Local Copy from Server…", self._menu_make_local_copy)
         menu_proj.addSeparator()
         add(menu_proj, "Search in Project…", self._search)
+        add(menu_proj, "Find Sessions (structured)…", self._find_sessions)
         add(menu_proj, "Generate Subject Summary CSV…", self._animal_summary)
 
         # Settings
@@ -319,6 +328,16 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Open error", f"Failed to open:\n{target}\n\n{e}")
 
+    def closeEvent(self, event):
+        """Ask any in-flight copy/backup jobs to stop so the app never tears
+        down a worker mid-write (which, with atomic copies, just discards the
+        partial temp file)."""
+        try:
+            cancel_all_jobs()
+        except Exception:
+            app_log.exception("Error signalling jobs to cancel on shutdown")
+        super().closeEvent(event)
+
     def _menu_make_local_copy(self):
         """Jump to Browse ▸ Server tab, so the user can pick an experiment /
         session and right-click ▸ Make local copy into the local rawData root."""
@@ -417,7 +436,7 @@ class MainWindow(QMainWindow):
         sync_pending(self.state.settings.data_root, log, entry_ids=entry_ids)
         return len(entry_ids)
 
-    def _start_backup_copy(self, project: str, experiment: str, destination_root: str, destination_kind: str, scheduled: bool, log=None):
+    def _start_backup_copy(self, project: str, experiment: str, destination_root: str, destination_kind: str, scheduled: bool, log=None, verify: bool = False, prune: bool = False):
         sink = log or self.rec_tab.logger.log
         source_dir = self._experiment_dir(project, experiment) if experiment else self._resolve_project_dir(project)
         if not os.path.isdir(source_dir):
@@ -446,6 +465,20 @@ class MainWindow(QMainWindow):
         scope = f"{project}/{experiment}" if experiment else project
         mode = "scheduled backup" if scheduled else "manual backup"
         destination_label = "external_hdd" if destination_kind == "hdd" else "server"
+
+        # Free-space precheck: refuse to start a backup that cannot possibly fit.
+        needed = tree_size(source_dir)
+        avail = free_space(dest_parent)
+        if avail and needed and needed > avail:
+            from .services.backup_report import human_size
+            msg = (f"[error] Not enough free space at destination for '{scope}': "
+                   f"need {human_size(needed)}, only {human_size(avail)} free. Backup not started.")
+            log(msg)
+            self.lbl_status.setText(f"Backup skipped: insufficient space for {scope}")
+            return
+
+        cancel = CancelToken()
+        self._backup_cancel[job_key] = cancel
         started = time()
         self._backup_jobs_in_progress.add(job_key)
         self.lbl_status.setText(f"{mode.capitalize()} running: {scope} -> {destination_label}")
@@ -456,23 +489,37 @@ class MainWindow(QMainWindow):
             run_error = ""
             staging_synced = 0
             try:
-                log(f"[{mode}/{destination_label}] Starting: {scope} -> {destination_scope_root}")
+                extra = (" [verify]" if verify else "") + (" [prune]" if prune else "")
+                log(f"[{mode}/{destination_label}] Starting: {scope} -> {destination_scope_root}{extra}")
+                if not experiment:
+                    # Drop a structure sidecar at the project root so the schema
+                    # travels with the backup and the Server browser can render it.
+                    try:
+                        save_structure_sidecar(source_dir, self.state.settings.resolve_structure_schema(project))
+                    except Exception:
+                        app_log.exception("Could not write structure sidecar for %s", project)
                 if destination_kind == "server":
                     try:
                         staging_synced = self._sync_pending_staging_for_project(project, log)
                     except Exception as exc:
                         log(f"[warning] Staging auto-sync failed: {exc}")
-                stats = sync_project_to_server(source_dir, dest_parent, log, dest_name=dest_name)
+                stats = sync_project_to_server(source_dir, dest_parent, log, dest_name=dest_name,
+                                               cancel=cancel, verify=verify, prune=prune)
                 dt = max(time() - started, 1e-6)
-                log(f"[{mode}/{destination_label}] Finished in {dt:.1f}s.")
-                if not experiment:
-                    self._annotate_current_session_backup_paths(project, destination_root, destination_kind, log)
-                ok = True
+                if stats.get("cancelled"):
+                    log(f"[{mode}/{destination_label}] Cancelled after {dt:.1f}s.")
+                else:
+                    log(f"[{mode}/{destination_label}] Finished in {dt:.1f}s.")
+                    if not experiment:
+                        self._annotate_current_session_backup_paths(project, destination_root, destination_kind, log)
+                ok = not stats.get("cancelled") and not stats.get("failed")
             except Exception as e:
                 run_error = str(e)
                 log(f"[error] {mode}/{destination_label} failed for '{scope}': {e}")
             finally:
                 self._backup_jobs_in_progress.discard(job_key)
+                self._backup_cancel.pop(job_key, None)
+                cancel.done()
                 if scheduled and ok:
                     self.state.settings.mark_backup_schedule_run(project, datetime.now().strftime("%Y-%m-%d"), experiment=experiment)
                 # Build, persist (on the GUI thread) and write out the run report.
@@ -495,6 +542,16 @@ class MainWindow(QMainWindow):
                     log(f"[warning] Could not record backup run: {exc}")
 
         run_in_thread(work)
+
+    def cancel_running_backups(self) -> int:
+        """Signal every in-flight backup to stop at the next file. Returns the
+        number of jobs asked to cancel."""
+        tokens = list(self._backup_cancel.values())
+        for t in tokens:
+            t.cancel()
+        if tokens:
+            self.lbl_status.setText("Cancelling backup…")
+        return len(tokens)
 
     def _copy_to_server(self):
         self._backup_project_now()
@@ -695,6 +752,8 @@ class MainWindow(QMainWindow):
             run_dates = sched.get("run_dates_by_experiment", {}) or {}
             if not isinstance(run_dates, dict):
                 run_dates = {}
+            verify = bool(sched.get("verify", False))
+            prune = bool(sched.get("prune", False))
 
             if backup_whole or not enabled_exps:
                 if str(sched.get("last_run_date", "")) == today:
@@ -706,6 +765,8 @@ class MainWindow(QMainWindow):
                         destination_root=destination_root,
                         destination_kind=kind,
                         scheduled=True,
+                        verify=verify,
+                        prune=prune,
                     )
                 continue
 
@@ -723,6 +784,8 @@ class MainWindow(QMainWindow):
                         destination_root=destination_root,
                         destination_kind=kind,
                         scheduled=True,
+                        verify=verify,
+                        prune=prune,
                     )
 
     def _schedule_server_backup(self):
@@ -1123,6 +1186,10 @@ class MainWindow(QMainWindow):
         result = dlg.schema()
         if dlg.selected_scope() == "project" and project:
             self.state.settings.put_project_structure_schema(project, result)
+            try:
+                save_structure_sidecar(self._resolve_project_dir(project), result)
+            except Exception:
+                app_log.exception("Could not write structure sidecar for %s", project)
             self.lbl_status.setText(f"Structure saved for project: {project}")
         else:
             self.state.settings.put_structure_schema(result)
@@ -1204,6 +1271,76 @@ class MainWindow(QMainWindow):
         lay.addWidget(btns)
         dlg.exec()
 
+    def _find_sessions(self):
+        proj = self.state.current_project
+        if not proj:
+            QMessageBox.warning(self, "No project", "Select a project first.")
+            return
+        project_dir = self._project_dir(proj)
+
+        from PySide6.QtWidgets import QListWidget, QListWidgetItem
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Find Sessions — {proj}")
+        dlg.resize(720, 520)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("Match sessions where ALL of these are true (blank rows ignored):"))
+
+        rows = []
+        for _ in range(3):
+            row = QHBoxLayout()
+            ed_field = QLineEdit()
+            ed_field.setPlaceholderText("metadata field, e.g. Region or Auto: sample rate (Hz)")
+            cb_op = QComboBox()
+            cb_op.addItems(OPERATORS)
+            ed_val = QLineEdit()
+            ed_val.setPlaceholderText("value")
+            row.addWidget(ed_field, 3)
+            row.addWidget(cb_op, 1)
+            row.addWidget(ed_val, 2)
+            lay.addLayout(row)
+            rows.append((ed_field, cb_op, ed_val))
+
+        b_search = QPushButton("Search")
+        b_search.setObjectName("Primary")
+        lay.addWidget(b_search)
+
+        lst = QListWidget()
+        lay.addWidget(lst, 1)
+        lbl_count = QLabel("")
+        lay.addWidget(lbl_count)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+
+        def run_query():
+            filters = [(f.text().strip(), o.currentText(), v.text().strip())
+                       for (f, o, v) in rows if f.text().strip()]
+            lst.clear()
+            try:
+                results = query_sessions(project_dir, filters)
+            except Exception as e:
+                QMessageBox.critical(dlg, "Search error", str(e))
+                return
+            for r in results:
+                rel = os.path.relpath(r["path"], project_dir)
+                it = QListWidgetItem(rel)
+                it.setData(Qt.UserRole, r["path"])
+                lst.addItem(it)
+            lbl_count.setText(f"{len(results)} session(s). Double-click to load into Record / Process.")
+
+        def open_item(item):
+            path = item.data(Qt.UserRole)
+            if path:
+                self._activate_project_everywhere(proj)
+                self._load_session_everywhere(path)
+
+        b_search.clicked.connect(run_query)
+        lst.itemDoubleClicked.connect(open_item)
+        run_query()
+        dlg.exec()
+
     def _animal_summary(self):
         proj = self.state.current_project
         subject = self.state.current_animal
@@ -1249,6 +1386,7 @@ class MainWindow(QMainWindow):
 
 
 def launch():
+    setup_logging()
     _set_windows_app_user_model_id()
     app = QApplication([])
     app.setApplicationName("MetaMan")

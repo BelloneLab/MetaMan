@@ -22,12 +22,19 @@ def save_json(path: str, data: Dict):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 def save_session_triplet(session_dir: str, meta: Dict, logger=None):
+    # metadata.json is the single source of truth; the .csv/.h5 are *derived*
+    # snapshots regenerated from it on every save and tagged as such so a stale
+    # export can never be mistaken for authoritative data.
+    from datetime import datetime
     save_json(os.path.join(session_dir, SESSION_META_JSON), meta)
     if logger: logger(f"Saved {SESSION_META_JSON}")
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     # CSV
     try:
         import pandas as pd
         row = {k: (json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v) for k, v in meta.items()}
+        row["_derived_from"] = SESSION_META_JSON
+        row["_generated_at"] = generated_at
         pd.DataFrame([row]).to_csv(os.path.join(session_dir, SESSION_META_CSV), index=False)
         if logger: logger(f"Saved {SESSION_META_CSV}")
     except Exception as e:
@@ -44,6 +51,8 @@ def save_session_triplet(session_dir: str, meta: Dict, logger=None):
                 else:
                     g.create_dataset(k, data="" if v is None else str(v), dtype=dt)
             g.create_dataset("all_json", data=json.dumps(meta, ensure_ascii=False), dtype=dt)
+            g.create_dataset("_derived_from", data=SESSION_META_JSON, dtype=dt)
+            g.create_dataset("_generated_at", data=generated_at, dtype=dt)
         if logger: logger(f"Saved {SESSION_META_H5}")
     except Exception as e:
         if logger: logger(f"[warn] H5 save skipped ({e})")
@@ -56,6 +65,20 @@ def save_project_info(project_dir: str, info: Dict):
 
 def load_project_info(project_dir: str) -> Dict:
     return load_json(os.path.join(project_dir, PROJECT_INFO_JSON)) or {}
+
+# Sidecar that records a project's folder-structure schema *inside* the project
+# folder, so the schema travels with the data (e.g. to a server) and the Server
+# browser can render the real hierarchy instead of guessing the default.
+STRUCTURE_SIDECAR = "_metaman_structure.json"
+
+def save_structure_sidecar(project_dir: str, schema: Dict):
+    try:
+        save_json(os.path.join(project_dir, STRUCTURE_SIDECAR), schema or {})
+    except Exception:
+        pass
+
+def load_structure_sidecar(project_dir: str) -> Optional[Dict]:
+    return load_json(os.path.join(project_dir, STRUCTURE_SIDECAR))
 
 def save_experiment_info(experiment_dir: str, info: Dict):
     save_json(os.path.join(experiment_dir, EXPERIMENT_INFO_JSON), info)
