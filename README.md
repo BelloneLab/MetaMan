@@ -78,11 +78,11 @@ Local and Server tabs share the same metadata panels. Colour-coded dots mark eac
 
 Every level (project, experiment, subject, session) has its own **notes** editor plus two power tools, right in the Browse panel:
 
-- **Update metadata from file...** imports fields straight into the selected scope from `CSV` / `TSV` / `JSON`, or `TXT` (`key: value`, `key=value` or tab-separated pairs). Plain-text lines become notes. No more retyping the surgery spreadsheet by hand.
-- **Upload files to project...** copies any file (a surgery log, a histology PDF, an analysis notebook) into `<project>/_metaman_uploads/...` and records it on the session under `uploaded_files`, so supporting documents travel with the data.
+- **Import metadata...** imports fields straight into the selected scope from `CSV` / `TSV` / `JSON`, or `TXT` (`key: value`, `key=value` or tab-separated pairs). Plain-text lines become notes. No more retyping the surgery spreadsheet by hand.
+- **Upload files...** copies any file (a surgery log, a histology PDF, an analysis notebook) into `<project>/_metaman_uploads/...` and records it on the session under `uploaded_files`, so supporting documents travel with the data.
 
 <p align="center">
-  <img src="docs/screenshots/09_metadata_notes.png" alt="Session metadata panel: notes editor, uploaded-file record, and the Update-metadata-from-file / Upload-files actions" width="68%" />
+  <img src="docs/screenshots/09_metadata_notes.png" alt="Session metadata panel: notes editor, uploaded-file record, and the Import metadata / Upload files actions" width="68%" />
 </p>
 
 ### 🔍 Search: find any session in seconds
@@ -237,8 +237,8 @@ Moving terabytes off an acquisition machine is the scary part. MetaMan is built 
 - Two tabs share one metadata view: **Local** (your data root) and **Server** (a network share). Both navigate the same project → subject → experiment → session hierarchy driven by each project's structure schema.
 - On the **Server** tab, point at the share holding the projects and browse it exactly like the local tree (browsing the server never changes your active local project).
 - View and edit metadata at all hierarchy levels, each with its own **notes** editor (saved with the metadata and to `session_notes.txt`).
-- **Update metadata from file**: import fields into the selected scope from CSV / TSV / TXT / JSON (key/value rows or a one-row table); free-text lines are appended as notes.
-- **Upload files to project**: copy arbitrary files into `<project>/_metaman_uploads/...`, recorded on the scope under `uploaded_files`.
+- **Import metadata**: import fields into the selected scope from CSV / TSV / TXT / JSON (key/value rows or a one-row table); free-text lines are appended as notes.
+- **Upload files**: copy arbitrary files into `<project>/_metaman_uploads/...`, recorded on the scope under `uploaded_files`.
 - Load subject metadata from CSV for one or multiple subjects.
 - **Right-click any node** for dataset actions: open, reveal, copy path, load a session into Record/Process, create a child, **Rename** and **Delete** (guarded: type-to-confirm, recycle bin where available).
 - **Make local copy** (Server tab): right-click a server project / experiment / session and it is reconstructed under your canonical local `rawData/...` so you can pull data down for analysis.

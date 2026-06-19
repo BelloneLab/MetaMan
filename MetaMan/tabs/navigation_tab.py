@@ -466,7 +466,7 @@ class NavigationTab(QWidget):
         self._notes_editors[kind] = editor
 
     def _add_scope_file_actions(self, row: QHBoxLayout, kind: str):
-        b_import_meta = QPushButton("Update metadata from file...")
+        b_import_meta = QPushButton("Import metadata...")
         b_import_meta.setToolTip(
             "Import CSV/TXT/JSON fields into the selected "
             f"{self._scope_label(kind).lower()} metadata."
@@ -474,7 +474,7 @@ class NavigationTab(QWidget):
         b_import_meta.clicked.connect(lambda _checked=False, k=kind: self._import_metadata_file_for_scope(k))
         row.addWidget(b_import_meta)
 
-        b_upload = QPushButton("Upload files to project...")
+        b_upload = QPushButton("Upload files...")
         b_upload.setToolTip(
             "Copy arbitrary files into the project upload folder and record them "
             f"on the selected {self._scope_label(kind).lower()}."
